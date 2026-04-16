@@ -83,3 +83,13 @@ ivf_pq_index
 # cuvs_bench
 datasets/
 /*.json
+
+# local vecflow integration artifacts
+/vecflow/examples/cpp/build-dev/
+/vecflow/examples/cpp/build-a100/
+/vecflow/examples/cpp/src/bench/mg_workers_*/
+/vecflow/examples/cpp/src/bench/results_*.json
+/thirdparty/Tagore/build-dev/
+/thirdparty/Tagore/build-a100/
+/thirdparty/phoenix/build-dev/
+/thirdparty/phoenix/build-a100/

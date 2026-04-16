@@ -21,6 +21,7 @@
 #include <rmm/mr/device/pool_memory_resource.hpp>
 
 #include <memory>
+#include <unordered_map>
 #include <type_traits>
 
 namespace shared_resources {
@@ -45,7 +46,7 @@ struct non_blocking_stream {
 };
 
 namespace detail {
-	inline std::vector<non_blocking_stream> global_stream_pool(0);
+	inline std::unordered_map<int, std::vector<non_blocking_stream>> global_stream_pools_by_device;
 	inline std::mutex gsp_mutex;
 }
 
@@ -58,11 +59,14 @@ namespace detail {
  */
 inline auto get_stream_from_global_pool() -> cudaStream_t
 {
+  int cuda_device = 0;
+  RAFT_CUDA_TRY(cudaGetDevice(&cuda_device));
   std::lock_guard guard(detail::gsp_mutex);
-  if (static_cast<int>(detail::global_stream_pool.size()) < n_threads) {
-    detail::global_stream_pool.resize(n_threads);
+  auto& device_stream_pool = detail::global_stream_pools_by_device[cuda_device];
+  if (static_cast<int>(device_stream_pool.size()) < n_threads) {
+    device_stream_pool.resize(n_threads);
   }
-  return detail::global_stream_pool[thread_id].view();
+  return device_stream_pool[thread_id].view();
 }
 
 /** Report a more verbose error with a backtrace when OOM occurs on RMM side. */

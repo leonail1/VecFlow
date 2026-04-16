@@ -128,6 +128,22 @@ int main(int argc, char** argv) {
 														full_ivf_graph_fname,
 														full_ivf_bfs_fname,
 														force_rebuild);
+	auto storage = vecflow::storage_stats(idx);
+	printf("\n=== Storage Stats ===\n");
+	printf("Graph tiers: HBM=%zu labels (%zu bytes), DRAM=%zu labels (%zu bytes), SSD=%zu labels (%zu bytes)\n",
+	       storage.graph.hbm.labels,
+	       storage.graph.hbm.bytes,
+	       storage.graph.dram.labels,
+	       storage.graph.dram.bytes,
+	       storage.graph.ssd.labels,
+	       storage.graph.ssd.bytes);
+	printf("Dataset tiers: HBM=%zu labels (%zu bytes), DRAM=%zu labels (%zu bytes), SSD=%zu labels (%zu bytes)\n",
+	       storage.dataset.hbm.labels,
+	       storage.dataset.hbm.bytes,
+	       storage.dataset.dram.labels,
+	       storage.dataset.dram.bytes,
+	       storage.dataset.ssd.labels,
+	       storage.dataset.ssd.bytes);
 
 	auto neighbors = raft::make_device_matrix<uint32_t, int64_t>(res, queries.extent(0), topk);
 	auto distances = raft::make_device_matrix<float, int64_t>(res, queries.extent(0), topk);

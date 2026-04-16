@@ -36,13 +36,49 @@ namespace cuvs::neighbors::vecflow {
     int specificity_threshold, \
     const std::string& graph_fname, \
     const std::string& bfs_fname, \
-    bool force_rebuild) -> cuvs::neighbors::vecflow::index<data_t> \
+    bool force_rebuild, \
+    graph_builder_type graph_builder, \
+    int tagore_iterations) -> cuvs::neighbors::vecflow::index<data_t> \
   { \
     return cuvs::neighbors::vecflow::build<data_t>( \
-      res, dataset, data_label_vecs, graph_degree, specificity_threshold, graph_fname, bfs_fname, force_rebuild); \
+      res, \
+      dataset, \
+      data_label_vecs, \
+      graph_degree, \
+      specificity_threshold, \
+      graph_fname, \
+      bfs_fname, \
+      force_rebuild, \
+      graph_builder, \
+      tagore_iterations); \
   }
 
 instantiate_build_vecflow_d(float);
 #undef instantiate_build_vecflow_d
+
+auto build_multi_gpu(shared_resources::configured_raft_resources& res,
+                     raft::device_matrix_view<const float, int64_t> dataset,
+                     const std::vector<std::vector<int>>& data_label_vecs,
+                     int graph_degree,
+                     int specificity_threshold,
+                     const multi_gpu_params& mg_params,
+                     const std::string& graph_fname,
+                     const std::string& bfs_fname,
+                     bool force_rebuild,
+                     graph_builder_type graph_builder,
+                     int tagore_iterations) -> cuvs::neighbors::vecflow::multi_gpu_index<float>
+{
+  return cuvs::neighbors::vecflow::build_multi_gpu_impl<float>(res,
+                                                               dataset,
+                                                               data_label_vecs,
+                                                               graph_degree,
+                                                               specificity_threshold,
+                                                               mg_params,
+                                                               graph_fname,
+                                                               bfs_fname,
+                                                               force_rebuild,
+                                                               graph_builder,
+                                                               tagore_iterations);
+}
 
 }  // namespace cuvs::neighbors::vecflow

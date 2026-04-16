@@ -1,0 +1,23 @@
+{
+  "data_dir": "/mnt/data/zj/sift1M/",
+  "data_fname": "sift_base_float.fbin",
+  "query_fname": "sift_query_float.fbin",
+  "data_label_fname": "base_all1.txt",
+  "query_label_fname": "query_all1.txt",
+  "algorithms_to_run": ["vecflow_tagore"],
+  "itopk_size": [128],
+  "spec_threshold": 2000,
+  "graph_degree": 16,
+  "topk": 100,
+  "num_runs": 100,
+  "warmup_runs": 5,
+  "ivf_graph_fname": "sift1m_all1_float_ivf_graph.bin",
+  "ivf_graph_tagore_fname": "sift1m_all1_float_ivf_graph_tagore.bin",
+  "ivf_bfs_fname": "sift1m_all1_float_ivf_bfs.bin",
+  "cagra_index_fname": "sift1m_all1_float_cagra_16.bin",
+  "ground_truth_fname": "sift_groundtruth.ibin",
+  "output_json_file": "/tmp/results_sift1m_tagore_phoenix_label_single.json",
+  "tagore_iterations": 10,
+  "use_phoenix_label_load": true,
+  "force_rebuild": false
+}

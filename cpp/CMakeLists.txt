@@ -70,6 +70,46 @@ option(DISABLE_DEPRECATION_WARNINGS "Disable deprecaction warnings " ON)
 option(DISABLE_OPENMP "Disable OpenMP" OFF)
 option(CUVS_NVTX "Enable nvtx markers" OFF)
 option(CUVS_RAFT_CLONE_ON_PIN "Explicitly clone RAFT branch when pinned to non-feature branch" ON)
+set(CUVS_VECFLOW_TAGORE_DEFAULT OFF)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/Tagore/include/Tagore_src.cuh")
+  set(CUVS_VECFLOW_TAGORE_DEFAULT ON)
+endif()
+set(_cuvs_vecflow_tagore_init "${CUVS_VECFLOW_TAGORE_DEFAULT}")
+if(DEFINED CACHE{VECFLOW_USE_TAGORE} AND NOT DEFINED CACHE{CUVS_VECFLOW_TAGORE})
+  set(_cuvs_vecflow_tagore_init "$CACHE{VECFLOW_USE_TAGORE}")
+endif()
+option(CUVS_VECFLOW_TAGORE "Enable Tagore-based VecFlow builder support" ${_cuvs_vecflow_tagore_init})
+set(VECFLOW_USE_TAGORE
+    "${CUVS_VECFLOW_TAGORE}"
+    CACHE BOOL "Compatibility alias for CUVS_VECFLOW_TAGORE"
+    FORCE)
+set(CUVS_VECFLOW_TAGORE_DIM_SIZE
+    192
+    CACHE STRING "Compile-time Tagore dimension upper bound used by VecFlow integration.")
+set(CUVS_VECFLOW_PHOENIX_DEFAULT OFF)
+set(CUVS_VECFLOW_PHOENIX_BUILD_DIR "")
+set(_cuvs_vecflow_phoenix_candidates
+    "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/phoenix/build-a100"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/phoenix/build"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/phoenix/build-dev")
+foreach(_phoenix_dir IN LISTS _cuvs_vecflow_phoenix_candidates)
+  if(EXISTS "${_phoenix_dir}/libphoenix.so")
+    set(CUVS_VECFLOW_PHOENIX_DEFAULT ON)
+    set(CUVS_VECFLOW_PHOENIX_BUILD_DIR "${_phoenix_dir}")
+    break()
+  endif()
+endforeach()
+set(_cuvs_vecflow_phoenix_init "${CUVS_VECFLOW_PHOENIX_DEFAULT}")
+if(DEFINED CACHE{VECFLOW_USE_PHOENIX} AND NOT DEFINED CACHE{CUVS_VECFLOW_PHOENIX})
+  set(_cuvs_vecflow_phoenix_init "$CACHE{VECFLOW_USE_PHOENIX}")
+endif()
+option(CUVS_VECFLOW_PHOENIX
+       "Enable Phoenix-assisted VecFlow graph loading"
+       ${_cuvs_vecflow_phoenix_init})
+set(VECFLOW_USE_PHOENIX
+    "${CUVS_VECFLOW_PHOENIX}"
+    CACHE BOOL "Compatibility alias for CUVS_VECFLOW_PHOENIX"
+    FORCE)
 
 if(BUILD_CPU_ONLY)
   set(BUILD_SHARED_LIBS OFF)
@@ -465,6 +505,7 @@ if(BUILD_SHARED_LIBS)
     src/neighbors/vecflow/detail/build_vecflow_int8_t.cu
     src/neighbors/vecflow/detail/search_vecflow_float.cu
     src/neighbors/vecflow/detail/search_vecflow_int8_t.cu
+    $<$<BOOL:${CUVS_VECFLOW_TAGORE}>:${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/Tagore/src/Tagore_src.cu>
     src/neighbors/refine/detail/refine_device_float_float.cu
     src/neighbors/refine/detail/refine_device_half_float.cu
     src/neighbors/refine/detail/refine_device_int8_t_float.cu
@@ -503,6 +544,33 @@ if(BUILD_SHARED_LIBS)
     cuvs_objs PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CUVS_CXX_FLAGS}>"
                       "$<$<COMPILE_LANGUAGE:CUDA>:${CUVS_CUDA_FLAGS}>"
   )
+  if(CUVS_VECFLOW_TAGORE)
+    set_source_files_properties(
+      "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/Tagore/src/Tagore_src.cu"
+      PROPERTIES COMPILE_OPTIONS "--diag-suppress=177,550,780"
+    )
+    target_include_directories(
+      cuvs_objs PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/Tagore/include"
+    )
+    target_compile_definitions(cuvs_objs PUBLIC CUVS_VECFLOW_TAGORE_ENABLED)
+    target_compile_definitions(cuvs_objs PUBLIC DIM_SIZE=${CUVS_VECFLOW_TAGORE_DIM_SIZE})
+  endif()
+  if(CUVS_VECFLOW_PHOENIX)
+    if(CUVS_VECFLOW_PHOENIX_BUILD_DIR STREQUAL "")
+      message(FATAL_ERROR "CUVS_VECFLOW_PHOENIX is ON, but libphoenix.so was not found")
+    endif()
+    if(NOT TARGET vecflow_phoenix)
+      add_library(vecflow_phoenix SHARED IMPORTED GLOBAL)
+      set_target_properties(
+        vecflow_phoenix PROPERTIES
+          IMPORTED_LOCATION "${CUVS_VECFLOW_PHOENIX_BUILD_DIR}/libphoenix.so"
+          INTERFACE_INCLUDE_DIRECTORIES
+            "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/phoenix/libphoenix/include"
+      )
+    endif()
+    target_link_libraries(cuvs_objs PRIVATE vecflow_phoenix)
+    target_compile_definitions(cuvs_objs PUBLIC CUVS_VECFLOW_PHOENIX_ENABLED)
+  endif()
   target_link_libraries(
     cuvs_objs PUBLIC raft::raft rmm::rmm ${CUVS_CTK_MATH_DEPENDENCIES}
                      $<TARGET_NAME_IF_EXISTS:OpenMP::OpenMP_CXX>
@@ -510,6 +578,11 @@ if(BUILD_SHARED_LIBS)
 
   add_library(cuvs SHARED $<TARGET_OBJECTS:cuvs_objs>)
   add_library(cuvs_static STATIC $<TARGET_OBJECTS:cuvs_objs>)
+
+  if(CUVS_VECFLOW_PHOENIX)
+    target_link_libraries(cuvs PRIVATE vecflow_phoenix)
+    target_link_libraries(cuvs_static PUBLIC vecflow_phoenix)
+  endif()
 
   target_compile_options(
     cuvs INTERFACE $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda

@@ -14,7 +14,35 @@
 
 #pragma once
 
+#include <limits>
+#include <filesystem>
+#include <rmm/device_scalar.hpp>
+#include <rmm/device_uvector.hpp>
+
 namespace cuvs::neighbors::vecflow {
+
+inline auto append_suffix_to_filename(const std::string& filename, const std::string& suffix)
+  -> std::string
+{
+  auto path = std::filesystem::path(filename);
+  auto stem = path.stem().string();
+  auto ext = path.extension().string();
+  auto parent = path.parent_path();
+  return (parent / (stem + suffix + ext)).string();
+}
+
+inline auto read_ibin_shape(const std::string& filename) -> std::pair<int64_t, int64_t>
+{
+  std::ifstream file(filename, std::ios::binary);
+  if (!file) { throw std::runtime_error("Cannot open file: " + filename); }
+
+  int64_t rows = 0;
+  int64_t cols = 0;
+  file.read(reinterpret_cast<char*>(&rows), sizeof(int64_t));
+  file.read(reinterpret_cast<char*>(&cols), sizeof(int64_t));
+  if (!file) { throw std::runtime_error("Cannot read ibin header from: " + filename); }
+  return {rows, cols};
+}
 
 inline void save_matrix_to_ibin(const std::string& filename,
                                 raft::host_matrix_view<uint32_t, int64_t> matrix) {
@@ -51,6 +79,35 @@ inline void load_matrix_from_ibin(const std::string& filename,
   std::cout << "Loading graph from " << filename << std::endl;
 }
 
+inline void save_vector_to_ibin(const std::string& filename, const std::vector<uint32_t>& values)
+{
+  std::ofstream file(filename, std::ios::binary);
+  if (!file) { throw std::runtime_error("Cannot create file: " + filename); }
+
+  auto rows = static_cast<int64_t>(values.size());
+  auto cols = int64_t{1};
+  file.write(reinterpret_cast<const char*>(&rows), sizeof(rows));
+  file.write(reinterpret_cast<const char*>(&cols), sizeof(cols));
+  file.write(reinterpret_cast<const char*>(values.data()), rows * sizeof(uint32_t));
+}
+
+inline auto load_vector_from_ibin(const std::string& filename) -> std::vector<uint32_t>
+{
+  auto [rows, cols] = read_ibin_shape(filename);
+  if (cols != 1) {
+    throw std::runtime_error("Vector cache file does not have one column: " + filename);
+  }
+
+  std::ifstream file(filename, std::ios::binary);
+  if (!file) { throw std::runtime_error("Cannot open file: " + filename); }
+  file.seekg(sizeof(int64_t) * 2, std::ios::beg);
+
+  std::vector<uint32_t> values(static_cast<std::size_t>(rows));
+  file.read(reinterpret_cast<char*>(values.data()), rows * sizeof(uint32_t));
+  if (!file) { throw std::runtime_error("Cannot read vector cache file: " + filename); }
+  return values;
+}
+
 template<typename T>
 struct QueryInfo {
   raft::device_vector<uint32_t, int64_t> cagra_query_map;
@@ -61,26 +118,57 @@ struct QueryInfo {
   raft::device_vector<uint32_t, int64_t> bfs_query_labels;
 };
 
-template<typename T>
-__global__ void classify_queries_kernel(const T* queries,
-                                        uint32_t* query_labels,
-                                        uint32_t* cat_freq,
-                                        uint32_t* temp_cagra_map,
-                                        uint32_t* temp_bfs_map,
-                                        T* temp_cagra_queries,
-                                        T* temp_bfs_queries,
-                                        uint32_t* temp_cagra_labels,
-                                        uint32_t* temp_bfs_labels,
-                                        int n_queries,
-                                        int dim,
-                                        int specificity_threshold,
-                                        int* cagra_count,
-                                        int* bfs_count) {
+template <typename T>
+struct query_classification_scratch {
+  explicit query_classification_scratch(cudaStream_t stream)
+    : temp_cagra_map(0, stream),
+      temp_bfs_map(0, stream),
+      temp_cagra_labels(0, stream),
+      temp_bfs_labels(0, stream),
+      counters(2, stream)
+  {
+  }
+
+  void ensure_capacity(std::size_t requested_queries, cudaStream_t stream)
+  {
+    if (capacity_queries >= requested_queries) { return; }
+    temp_cagra_map.resize(requested_queries, stream);
+    temp_bfs_map.resize(requested_queries, stream);
+    temp_cagra_labels.resize(requested_queries, stream);
+    temp_bfs_labels.resize(requested_queries, stream);
+    capacity_queries = requested_queries;
+  }
+
+  void reset(cudaStream_t stream)
+  {
+    RAFT_CUDA_TRY(cudaMemsetAsync(counters.data(), 0, counters.size() * sizeof(int), stream));
+  }
+
+  rmm::device_uvector<uint32_t> temp_cagra_map;
+  rmm::device_uvector<uint32_t> temp_bfs_map;
+  rmm::device_uvector<uint32_t> temp_cagra_labels;
+  rmm::device_uvector<uint32_t> temp_bfs_labels;
+  rmm::device_uvector<int> counters;
+  std::size_t capacity_queries = 0;
+};
+
+static __global__ void classify_queries_kernel(uint32_t* query_labels,
+                                               uint32_t* cat_freq,
+                                               uint32_t* temp_cagra_map,
+                                               uint32_t* temp_bfs_map,
+                                               uint32_t* temp_cagra_labels,
+                                               uint32_t* temp_bfs_labels,
+                                               int n_queries,
+                                               int n_labels,
+                                               int specificity_threshold,
+                                               int* cagra_count,
+                                               int* bfs_count) {
   
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid >= n_queries) return;
 
   uint32_t label = query_labels[tid];
+  if (label >= static_cast<uint32_t>(n_labels)) return;
   uint32_t freq = cat_freq[label];
   bool is_cagra = freq > specificity_threshold;
   
@@ -89,19 +177,27 @@ __global__ void classify_queries_kernel(const T* queries,
     pos = atomicAdd(cagra_count, 1);
     temp_cagra_map[pos] = tid;
     temp_cagra_labels[pos] = label;
-    
-    for (int j = 0; j < dim; j++) {
-      temp_cagra_queries[pos * dim + j] = queries[tid * dim + j];
-    }
   } else {
     pos = atomicAdd(bfs_count, 1);
     temp_bfs_map[pos] = tid;
     temp_bfs_labels[pos] = label;
-    
-    for (int j = 0; j < dim; j++) {
-      temp_bfs_queries[pos * dim + j] = queries[tid * dim + j];
-    }
   }
+}
+
+template <typename T>
+__global__ void gather_queries_by_map_kernel(const T* queries,
+                                             const uint32_t* query_map,
+                                             T* gathered_queries,
+                                             int64_t n_queries,
+                                             int64_t dim)
+{
+  auto tid   = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  auto total = n_queries * dim;
+  if (tid >= total) { return; }
+
+  auto row = tid / dim;
+  auto col = tid % dim;
+  gathered_queries[tid] = queries[static_cast<int64_t>(query_map[row]) * dim + col];
 }
 
 template<typename T>
@@ -109,49 +205,56 @@ inline auto classify_queries(raft::resources const& res,
                              raft::device_matrix_view<const T, int64_t> queries,
                              raft::device_vector_view<uint32_t, int64_t> query_labels,
                              raft::device_vector_view<uint32_t, int64_t> cat_freq,
-                             int specificity_threshold) -> QueryInfo<T> {
+                             int specificity_threshold,
+                             query_classification_scratch<T>* scratch = nullptr) -> QueryInfo<T> {
   
   int n_queries = queries.extent(0);
   int dim = queries.extent(1);
 
+  if (n_queries == 0) {
+    return QueryInfo<T>{
+      raft::make_device_vector<uint32_t, int64_t>(res, 0),
+      raft::make_device_matrix<T, int64_t>(res, 0, dim),
+      raft::make_device_vector<uint32_t, int64_t>(res, 0),
+      raft::make_device_vector<uint32_t, int64_t>(res, 0),
+      raft::make_device_matrix<T, int64_t>(res, 0, dim),
+      raft::make_device_vector<uint32_t, int64_t>(res, 0)};
+  }
+
   auto stream = raft::resource::get_cuda_stream(res);
-  
-  // Create temporary device memory
-  rmm::device_uvector<uint32_t> temp_cagra_map(n_queries, stream);
-  rmm::device_uvector<uint32_t> temp_bfs_map(n_queries, stream);
-  rmm::device_uvector<T> temp_cagra_queries(n_queries * dim, stream);
-  rmm::device_uvector<T> temp_bfs_queries(n_queries * dim, stream);
-  rmm::device_uvector<uint32_t> temp_cagra_labels(n_queries, stream);
-  rmm::device_uvector<uint32_t> temp_bfs_labels(n_queries, stream);
-  
-  // Counters
-  rmm::device_scalar<int> d_cagra_count(0, stream);
-  rmm::device_scalar<int> d_bfs_count(0, stream);
+
+  std::unique_ptr<query_classification_scratch<T>> owned_scratch;
+  if (scratch == nullptr) {
+    owned_scratch = std::make_unique<query_classification_scratch<T>>(stream);
+    scratch = owned_scratch.get();
+  }
+  scratch->ensure_capacity(static_cast<std::size_t>(n_queries), stream);
+  scratch->reset(stream);
   
   // Launch kernel
   int block_size = 256;
   int grid_size = (n_queries + block_size - 1) / block_size;
   
   classify_queries_kernel<<<grid_size, block_size, 0, stream>>>(
-    queries.data_handle(),
     query_labels.data_handle(),
     cat_freq.data_handle(),
-    temp_cagra_map.data(),
-    temp_bfs_map.data(),
-    temp_cagra_queries.data(),
-    temp_bfs_queries.data(),
-    temp_cagra_labels.data(),
-    temp_bfs_labels.data(),
+    scratch->temp_cagra_map.data(),
+    scratch->temp_bfs_map.data(),
+    scratch->temp_cagra_labels.data(),
+    scratch->temp_bfs_labels.data(),
     n_queries,
-    dim,
+    static_cast<int>(cat_freq.extent(0)),
     specificity_threshold,
-    d_cagra_count.data(),
-    d_bfs_count.data()
+    scratch->counters.data(),
+    scratch->counters.data() + 1
   );
   
   // Get final counts
-  int h_cagra_count = d_cagra_count.value(stream);
-  int h_bfs_count = d_bfs_count.value(stream);
+  int host_counts[2] = {0, 0};
+  raft::copy(host_counts, scratch->counters.data(), 2, stream);
+  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+  int h_cagra_count = host_counts[0];
+  int h_bfs_count = host_counts[1];
 
   // Initialize raft structures with correct sizes
   auto cagra_query_map = raft::make_device_vector<uint32_t, int64_t>(res, h_cagra_count);
@@ -163,34 +266,46 @@ inline auto classify_queries(raft::resources const& res,
   
   // Copy from temporary buffers to final raft structures
   raft::copy(cagra_query_map.data_handle(),
-             temp_cagra_map.data(),
+             scratch->temp_cagra_map.data(),
              h_cagra_count,
              stream);
-  
-  raft::copy(cagra_queries.data_handle(),
-             temp_cagra_queries.data(),
-             h_cagra_count * dim,
-             stream);
-             
   raft::copy(cagra_query_labels.data_handle(),
-             temp_cagra_labels.data(),
+             scratch->temp_cagra_labels.data(),
              h_cagra_count,
              stream);
   
   raft::copy(bfs_query_map.data_handle(),
-             temp_bfs_map.data(),
+             scratch->temp_bfs_map.data(),
              h_bfs_count,
              stream);
-  
-  raft::copy(bfs_queries.data_handle(),
-             temp_bfs_queries.data(),
-             h_bfs_count * dim,
-             stream);
-             
   raft::copy(bfs_query_labels.data_handle(),
-             temp_bfs_labels.data(),
+             scratch->temp_bfs_labels.data(),
              h_bfs_count,
              stream);
+
+  if (h_cagra_count > 0) {
+    auto cagra_total_values = static_cast<int64_t>(h_cagra_count) * dim;
+    auto cagra_grid_size =
+      static_cast<int>((cagra_total_values + block_size - 1) / block_size);
+    gather_queries_by_map_kernel<<<cagra_grid_size, block_size, 0, stream>>>(
+      queries.data_handle(),
+      cagra_query_map.data_handle(),
+      cagra_queries.data_handle(),
+      h_cagra_count,
+      dim);
+  }
+
+  if (h_bfs_count > 0) {
+    auto bfs_total_values = static_cast<int64_t>(h_bfs_count) * dim;
+    auto bfs_grid_size =
+      static_cast<int>((bfs_total_values + block_size - 1) / block_size);
+    gather_queries_by_map_kernel<<<bfs_grid_size, block_size, 0, stream>>>(
+      queries.data_handle(),
+      bfs_query_map.data_handle(),
+      bfs_queries.data_handle(),
+      h_bfs_count,
+      dim);
+  }
   
   return QueryInfo<T> {
     std::move(cagra_query_map),
@@ -200,6 +315,35 @@ inline auto classify_queries(raft::resources const& res,
     std::move(bfs_queries),
     std::move(bfs_query_labels)
   };
+}
+
+template <typename T>
+__global__ void fill_values_kernel(T* output, int64_t size, T value)
+{
+  auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (tid >= size) { return; }
+  output[tid] = value;
+}
+
+template <typename T>
+inline void fill_device_values(raft::resources const& res, T* output, int64_t size, T value)
+{
+  if (size <= 0) { return; }
+  auto stream = raft::resource::get_cuda_stream(res);
+  auto block_size = 256;
+  auto grid_size = static_cast<int>((size + block_size - 1) / block_size);
+  fill_values_kernel<<<grid_size, block_size, 0, stream>>>(output, size, value);
+}
+
+inline void initialize_search_results(raft::resources const& res,
+                                      raft::device_matrix_view<uint32_t, int64_t> neighbors,
+                                      raft::device_matrix_view<float, int64_t> distances)
+{
+  auto stream = raft::resource::get_cuda_stream(res);
+  RAFT_CUDA_TRY(cudaMemsetAsync(
+    neighbors.data_handle(), 0xFF, neighbors.size() * sizeof(uint32_t), stream));
+  fill_device_values<float>(
+    res, distances.data_handle(), distances.size(), std::numeric_limits<float>::infinity());
 }
 
 template<typename T, typename IdxT>

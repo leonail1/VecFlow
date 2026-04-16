@@ -23,6 +23,7 @@
 #include <raft/core/resource/cuda_stream.hpp>
 #include <raft/core/resources.hpp>
 
+#include <thrust/reduce.h>
 #include <thrust/sequence.h>
 
 namespace cuvs::neighbors {
@@ -69,6 +70,15 @@ void search_filtered_bfs_core(raft::resources const& res,
                    thrust::counting_iterator<int>(n_queries),
                    chunk_fill);
 
+  uint32_t max_samples = 0;
+  if (n_queries > 0) {
+    max_samples = thrust::reduce(raft::resource::get_thrust_policy(res),
+                                 chunk_index.begin(),
+                                 chunk_index.end(),
+                                 uint32_t{0},
+                                 thrust::maximum<uint32_t>());
+  }
+
   uint32_t grid_dim_x = 1;
 
   cuvs::neighbors::ivf_flat::detail::ivfflat_interleaved_scan<
@@ -82,7 +92,7 @@ void search_filtered_bfs_core(raft::resources const& res,
            cuvs::distance::DistanceType(idx.metric()),
            1,
            k,
-           0,
+           max_samples,
            chunk_index.data(),
            cuvs::distance::is_min_close(cuvs::distance::DistanceType(metric)),
            sample_filter,

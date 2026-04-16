@@ -1,9 +1,17 @@
+#include <algorithm>
 #include <cstdint>
 #include <fstream>
-#include <vector>
 #include <iostream>
-#include <cuvs/neighbors/brute_force.hpp>
 #include <sstream>
+#include <type_traits>
+#include <vector>
+#include <cuvs/neighbors/brute_force.hpp>
+
+bool has_suffix(const std::string& filename, const std::string& suffix)
+{
+	return filename.size() >= suffix.size() &&
+	       filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
 
 // Helper function to check if a file is in text format
 bool is_text_format(const std::string& filename) {
@@ -103,32 +111,43 @@ void read_labeled_data(std::string data_fname,
 											 uint32_t* q_N_out,
 											 uint32_t* dim_out) {
 
-	// Read datafile in
-	std::ifstream datafile(data_fname, std::ifstream::binary);
-	if (!datafile) {
-		throw std::runtime_error("Unable to open data file: " + data_fname);
-	}
-	uint32_t N, dim;
-	datafile.read(reinterpret_cast<char*>(&N), sizeof(uint32_t));
-	datafile.read(reinterpret_cast<char*>(&dim), sizeof(uint32_t));
-	data->resize(N*dim);
-	datafile.read(reinterpret_cast<char*>(data->data()), N*dim*sizeof(T));
-	datafile.close();
+	auto read_vectors =
+		[](const std::string& fname, std::vector<T>* out, uint32_t* rows, uint32_t* cols) {
+			std::ifstream file(fname, std::ifstream::binary);
+			if (!file) {
+				throw std::runtime_error("Unable to open vector file: " + fname);
+			}
+			uint32_t n, dim;
+			file.read(reinterpret_cast<char*>(&n), sizeof(uint32_t));
+			file.read(reinterpret_cast<char*>(&dim), sizeof(uint32_t));
+			if constexpr (std::is_same_v<T, float>) {
+				if (has_suffix(fname, ".u8bin")) {
+					std::vector<uint8_t> tmp(n * dim);
+					file.read(reinterpret_cast<char*>(tmp.data()), tmp.size() * sizeof(uint8_t));
+					out->resize(n * dim);
+					std::transform(
+						tmp.begin(), tmp.end(), out->begin(), [](uint8_t v) { return static_cast<float>(v); });
+				} else {
+					out->resize(n * dim);
+					file.read(reinterpret_cast<char*>(out->data()), out->size() * sizeof(T));
+				}
+			} else {
+				out->resize(n * dim);
+				file.read(reinterpret_cast<char*>(out->data()), out->size() * sizeof(T));
+			}
+			file.close();
+			if (rows != nullptr) *rows = n;
+			if (cols != nullptr) *cols = dim;
+		};
 
-	// read query data in
-	std::ifstream queryfile(query_fname, std::ifstream::binary);
-	if (!queryfile) {
-		throw std::runtime_error("Unable to open query file: " + query_fname);
-	}
+	uint32_t N, dim;
+	read_vectors(data_fname, data, &N, &dim);
+
 	uint32_t q_N, q_dim;
-	queryfile.read(reinterpret_cast<char*>(&q_N), sizeof(uint32_t));
-	queryfile.read(reinterpret_cast<char*>(&q_dim), sizeof(uint32_t));
+	read_vectors(query_fname, queries, &q_N, &q_dim);
 	if (q_dim != dim) {
 		throw std::runtime_error("Query dim and data dim don't match!");
 	}
-	queries->resize(q_N*dim);
-	queryfile.read(reinterpret_cast<char*>(queries->data()), q_N*dim*sizeof(T));
-	queryfile.close();
 
 	// Read data labels (supporting both text and spmat formats)
 	std::vector<std::vector<int>> data_row_labels;
@@ -373,6 +392,7 @@ double compute_recall(const raft::resources& res,
 		// Count matches between found and ground truth neighbors
 		for (int j = 0; j < topk; j++) {
 			uint32_t neighbor_idx = h_neighbors.view()(i, j);
+      if (neighbor_idx == UINT32_MAX) { continue; }
 
 			// Check if neighbor_idx is in the ground truth
 			for (int k = 0; k < topk; k++) {

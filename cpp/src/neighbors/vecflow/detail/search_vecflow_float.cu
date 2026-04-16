@@ -44,4 +44,16 @@ namespace cuvs::neighbors::vecflow {
 instantiate_search_vecflow_d(float);
 #undef instantiate_search_vecflow_d
 
+void search_multi_gpu(shared_resources::configured_raft_resources& res,
+                      cuvs::neighbors::vecflow::multi_gpu_index<float>& index,
+                      raft::device_matrix_view<const float, int64_t> queries,
+                      raft::device_vector_view<uint32_t, int64_t> query_labels,
+                      int itopk_size,
+                      raft::device_matrix_view<uint32_t, int64_t> neighbors,
+                      raft::device_matrix_view<float, int64_t> distances)
+{
+  cuvs::neighbors::vecflow::search_multi_gpu_impl(
+    res, index, queries, query_labels, itopk_size, neighbors, distances);
+}
+
 }  // namespace cuvs::neighbors::vecflow

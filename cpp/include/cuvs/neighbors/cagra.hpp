@@ -154,13 +154,13 @@ struct index_params : cuvs::neighbors::index_params {
 
 enum class search_algo {
   /** For large batch sizes. */
-  SINGLE_CTA,
+  SINGLE_CTA = 0,
   /** For small batch sizes. */
-  MULTI_CTA,
-  MULTI_KERNEL,
+  MULTI_CTA = 1,
+  MULTI_KERNEL = 2,
+  AUTO = 3,
   /** For filtered search. */
-  SINGLE_CTA_FILTERED,
-  AUTO
+  SINGLE_CTA_FILTERED = 4
 };
 
 enum class hash_mode { HASH, SMALL, AUTO };

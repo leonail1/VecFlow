@@ -1,0 +1,22 @@
+{
+  "data_dir": "/mnt/data/yfcc10m_tagore_subset100k/",
+  "data_fname": "base.100k.u8bin",
+  "query_fname": "query.matching.200.u8bin",
+  "data_label_fname": "base.metadata.100k.spmat",
+  "query_label_fname": "query.metadata.matching.200.spmat",
+  "algorithms_to_run": ["vecflow_tagore"],
+  "itopk_size": [256],
+  "spec_threshold": 1000,
+  "graph_degree": 16,
+  "topk": 10,
+  "num_runs": 1,
+  "warmup_runs": 0,
+  "ivf_graph_fname": "ivf_graph_yfcc100k_subset.bin",
+  "ivf_graph_tagore_fname": "ivf_graph_tagore_yfcc100k_subset.bin",
+  "ivf_bfs_fname": "ivf_bfs_yfcc100k_subset.bin",
+  "cagra_index_fname": "cagra_yfcc100k_subset_16.bin",
+  "ground_truth_fname": "gt.matching.200.ibin",
+  "output_json_file": "/tmp/results_yfcc100k_subset_tagore_q200.json",
+  "tagore_iterations": 10,
+  "force_rebuild": true
+}

@@ -1,0 +1,4 @@
+[submodule "thirdparty/DiskANN"]
+	path = thirdparty/DiskANN
+	url = git@github.com:microsoft/DiskANN.git
+	branch = cpp_main

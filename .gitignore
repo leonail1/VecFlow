@@ -93,3 +93,13 @@ datasets/
 /thirdparty/Tagore/build-a100/
 /thirdparty/phoenix/build-dev/
 /thirdparty/phoenix/build-a100/
+
+# large local experiment intermediates (keep reproducible bundle only)
+/experiment_results/three_way_comparison/diskann_index/
+/experiment_results/three_way_comparison/filteredvamana_memory_repro/
+/experiment_results/three_way_comparison/filteredvamana_ssd_repro/
+/experiment_results/three_way_comparison/diskann_results/*.bin
+/experiment_results/three_way_comparison/filteredvamana_reuse_index_repro/cache/*.u8bin
+
+# local third-party source clones (not committed in this repo)
+/thirdparty/DiskANN/

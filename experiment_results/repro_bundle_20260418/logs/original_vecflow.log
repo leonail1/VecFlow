@@ -1,0 +1,47 @@
+CMD: numactl --cpunodebind=1 --membind=1 /home/lzg/VecFlow/vecflow/examples/cpp/build-yfcc/VECFLOW_BENCH --config /home/lzg/VecFlow-develop/experiment_results/three_way_comparison/configs/original_vecflow.json
+RC: 0
+Elapsed: 82.0s
+--- STDOUT ---
+Loading configuration from /home/lzg/VecFlow-develop/experiment_results/three_way_comparison/configs/original_vecflow.json
+
+=== Configuration ===
+iTopK sizes: [ 64 ]
+Specificity threshold: 2000
+Graph degree: 16
+TopK: 10
+Number of runs: 5
+Warmup runs: 2
+Algorithms to run: [ vecflow ]
+Output JSON file: /home/lzg/VecFlow-develop/experiment_results/three_way_comparison/original_vecflow_results.json
+Reading data labels from spmat format: /home/lzg/VecFlow/vecflow/datasets/yfcc10M/base.metadata.10M.spmat
+Reading query labels from spmat format: /home/lzg/VecFlow/vecflow/datasets/yfcc10M/query.metadata.public.single_label.spmat
+
+=== Dataset Information ===
+Base dataset size: N=10000000, dim=192
+Query dataset size: N=61626, dim=192
+
+=== VecFlow Index Building and Search ===
+
+=== Index Information ===
+Loading graph from /home/lzg/VecFlow/vecflow/datasets/yfcc10M/ivf_graph_yfcc10m_t2000.bin
+Loading IVF-BFS index from /home/lzg/VecFlow/vecflow/datasets/yfcc10M/ivf_bfs_yfcc10m_t2000.bin
+
+IVF-Graph Index Stats:
+  Total vectors:  10000000
+  Number of labels: 6435
+  Graph size:     [80259814 × 16]
+  Graph degree:   16
+
+IVF-BFS Index Stats:
+  Number of labels: 193951
+  Number of rows:  27950662
+
+=== VecFlow Search Benchmarking ===
+-- Running VecFlow Search (itopk=64) --
+  - QPS: 2115134.41, Recall@10: 0.9642
+
+Writing results to /home/lzg/VecFlow-develop/experiment_results/three_way_comparison/original_vecflow_results.json
+Results successfully written.
+
+--- STDERR ---
+

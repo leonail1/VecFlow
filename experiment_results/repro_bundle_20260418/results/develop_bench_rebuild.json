@@ -1,0 +1,165 @@
+[
+  {
+    "algorithm": "vecflow",
+    "build_seconds": 2212.286042304,
+    "cache_counters": {
+      "phoenix_dataset": {
+        "access_events": 0,
+        "dram_evictions": 0,
+        "dram_hits": 0,
+        "hbm_evictions": 0,
+        "hbm_hits": 0,
+        "ssd_loads": 0
+      },
+      "phoenix_graph": {
+        "access_events": 0,
+        "dram_evictions": 0,
+        "dram_hits": 0,
+        "hbm_evictions": 0,
+        "hbm_hits": 0,
+        "ssd_loads": 0
+      },
+      "tiered_bfs": {
+        "access_events": 0,
+        "dram_evictions": 0,
+        "dram_hits": 0,
+        "hbm_evictions": 0,
+        "hbm_hits": 0,
+        "ssd_loads": 0
+      }
+    },
+    "cpu_overhead_ms": {
+      "avg_ms": 0.050903354003907,
+      "max_ms": 0.050903354003907,
+      "p50_ms": 0.050903354003907,
+      "p95_ms": 0.050903354003907,
+      "total_ms": 0.050903354003907
+    },
+    "dynamic_stop_latency_rel_span": 0.0,
+    "dynamic_stop_qps_rel_span": 0.0,
+    "dynamic_stop_reason": "reached max_num_runs",
+    "dynamic_stop_subset_mean_latency_ms": 94.053978,
+    "dynamic_stop_subset_mean_qps": 655219.4953412816,
+    "dynamic_stop_subset_runs": [
+      1
+    ],
+    "dynamic_stop_triggered": false,
+    "gpu_latency_ms": {
+      "avg_ms": 94.0030746459961,
+      "max_ms": 94.0030746459961,
+      "p50_ms": 94.0030746459961,
+      "p95_ms": 94.0030746459961,
+      "total_ms": 94.0030746459961
+    },
+    "ground_truth_label_mode": "any",
+    "itopk": 64,
+    "latency_ms": {
+      "avg_ms": 94.053978,
+      "max_ms": 94.053978,
+      "p50_ms": 94.053978,
+      "p95_ms": 94.053978,
+      "total_ms": 94.053978
+    },
+    "latency_stability_rel_tol": 0.0,
+    "max_num_runs": 1,
+    "min_num_runs": 1,
+    "num_queries": 61626,
+    "num_runs": 1,
+    "num_runs_requested": 1,
+    "qps": 655219.4953412816,
+    "qps_stability_rel_tol": 0.0,
+    "query_label_mode": "single",
+    "query_offset": 0,
+    "recall": 0.9641608883628663,
+    "run_gpu_latency_ms_samples": [
+      94.0030746459961
+    ],
+    "run_latency_ms_samples": [
+      94.053978
+    ],
+    "run_qps_samples": [
+      655219.4953412816
+    ],
+    "search_seconds": 0.094053978,
+    "skip_recall": false,
+    "stability_window": 1,
+    "stable_subset_size": 1,
+    "storage_stats": {
+      "access_events": 0,
+      "bfs": {
+        "dram": {
+          "bytes": 0,
+          "labels": 0
+        },
+        "hbm": {
+          "bytes": 23930325248,
+          "labels": 193928
+        },
+        "resident_dram": {
+          "bytes": 0,
+          "labels": 0
+        },
+        "resident_hbm": {
+          "bytes": 23930325248,
+          "labels": 193928
+        },
+        "ssd": {
+          "bytes": 0,
+          "labels": 0
+        },
+        "total_bytes": 23930325248,
+        "total_labels": 193928
+      },
+      "dataset": {
+        "dram": {
+          "bytes": 0,
+          "labels": 0
+        },
+        "hbm": {
+          "bytes": 61639537152,
+          "labels": 6435
+        },
+        "resident_dram": {
+          "bytes": 0,
+          "labels": 0
+        },
+        "resident_hbm": {
+          "bytes": 61639537152,
+          "labels": 6435
+        },
+        "ssd": {
+          "bytes": 0,
+          "labels": 0
+        },
+        "total_bytes": 61639537152,
+        "total_labels": 6435
+      },
+      "graph": {
+        "dram": {
+          "bytes": 0,
+          "labels": 0
+        },
+        "hbm": {
+          "bytes": 5136628096,
+          "labels": 6435
+        },
+        "resident_dram": {
+          "bytes": 0,
+          "labels": 0
+        },
+        "resident_hbm": {
+          "bytes": 5136628096,
+          "labels": 6435
+        },
+        "ssd": {
+          "bytes": 0,
+          "labels": 0
+        },
+        "total_bytes": 5136628096,
+        "total_labels": 6435
+      }
+    },
+    "trend_guard_rel_tol": 0.0,
+    "warmup_runs": 0
+  }
+]

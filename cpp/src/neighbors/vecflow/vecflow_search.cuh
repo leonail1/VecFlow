@@ -319,6 +319,56 @@ inline auto make_device_storage_owner(T* device_storage, int cuda_device_ordinal
 }
 
 template <typename T>
+class reusable_device_buffer {
+ public:
+  reusable_device_buffer() = default;
+
+  ~reusable_device_buffer()
+  {
+    if (storage_ != nullptr) {
+      free_device_storage(cuda_device_ordinal_, storage_);
+      storage_        = nullptr;
+      capacity_bytes_ = 0;
+    }
+  }
+
+  reusable_device_buffer(const reusable_device_buffer&) = delete;
+  auto operator=(const reusable_device_buffer&) -> reusable_device_buffer& = delete;
+  reusable_device_buffer(reusable_device_buffer&&) = delete;
+  auto operator=(reusable_device_buffer&&) -> reusable_device_buffer& = delete;
+
+  auto copy_from_host(shared_resources::configured_raft_resources& res,
+                      const T* host_storage,
+                      std::size_t bytes) -> std::shared_ptr<T>
+  {
+    auto stream = raft::resource::get_cuda_stream(res);
+    ensure_capacity(bytes);
+    RAFT_CUDA_TRY(
+      cudaMemcpyAsync(storage_, host_storage, bytes, cudaMemcpyHostToDevice, stream));
+    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+    return std::shared_ptr<T>(storage_, [](T*) {});
+  }
+
+ private:
+  void ensure_capacity(std::size_t requested_bytes)
+  {
+    if (capacity_bytes_ >= requested_bytes && storage_ != nullptr) { return; }
+    if (storage_ != nullptr) {
+      free_device_storage(cuda_device_ordinal_, storage_);
+      storage_        = nullptr;
+      capacity_bytes_ = 0;
+    }
+    RAFT_CUDA_TRY(cudaGetDevice(&cuda_device_ordinal_));
+    RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&storage_), requested_bytes));
+    capacity_bytes_ = requested_bytes;
+  }
+
+  int cuda_device_ordinal_ = 0;
+  T* storage_              = nullptr;
+  std::size_t capacity_bytes_ = 0;
+};
+
+template <typename T>
 inline auto make_device_storage_from_host(shared_resources::configured_raft_resources& res,
                                           const T* host_storage,
                                           std::size_t bytes)
@@ -1584,7 +1634,8 @@ auto finalize_loaded_bfs_label(shared_resources::configured_raft_resources& res,
 template <typename data_t>
 auto get_or_load_bfs_label_index(shared_resources::configured_raft_resources& res,
                                  cuvs::neighbors::vecflow::index<data_t>& index,
-                                 uint32_t label)
+                                 uint32_t label,
+                                 reusable_device_buffer<data_t>* reusable_buffer = nullptr)
   -> std::shared_ptr<cuvs::neighbors::ivf_flat::index<data_t, int64_t>>
 {
   if (label >= index.host_bfs_label_size.size() || label >= index.host_bfs_label_offset.size()) {
@@ -1625,7 +1676,9 @@ auto get_or_load_bfs_label_index(shared_resources::configured_raft_resources& re
       }
     }
     if (host_storage != nullptr) {
-      auto device_rows = make_device_storage_from_host(res, host_storage.get(), dram_bytes);
+      auto device_rows = reusable_buffer != nullptr
+        ? reusable_buffer->copy_from_host(res, host_storage.get(), dram_bytes)
+        : make_device_storage_from_host(res, host_storage.get(), dram_bytes);
       return finalize_loaded_bfs_label(
         res, index, label, label_offset, label_size, std::move(device_rows), false);
     }
@@ -1782,7 +1835,8 @@ inline auto resolve_prefetched_or_load_bfs_label_index(
   cuvs::neighbors::vecflow::index<data_t>& index,
   uint32_t label,
   std::unique_ptr<async_host_copy_request<data_t>>& prefetched_dram_request,
-  uint32_t* prefetched_label)
+  uint32_t* prefetched_label,
+  reusable_device_buffer<data_t>* reusable_buffer = nullptr)
   -> std::shared_ptr<cuvs::neighbors::ivf_flat::index<data_t, int64_t>>
 {
   if (prefetched_label != nullptr && prefetched_dram_request != nullptr &&
@@ -1802,7 +1856,7 @@ inline auto resolve_prefetched_or_load_bfs_label_index(
     return finalize_loaded_bfs_label(
       res, index, label, label_offset, label_size, std::move(device_rows), false);
   }
-  return get_or_load_bfs_label_index(res, index, label);
+  return get_or_load_bfs_label_index(res, index, label, reusable_buffer);
 }
 
 template <typename data_t>
@@ -1998,6 +2052,7 @@ void search_bfs_with_tiered_cache(shared_resources::configured_raft_resources& r
 
   std::unique_ptr<async_host_copy_request<data_t>> prefetched_dram_request;
   uint32_t prefetched_label = UINT32_MAX;
+  reusable_device_buffer<data_t> dram_staging_buffer;
 
   for (std::size_t label_position = 0; label_position < non_hbm_labels.size(); ++label_position) {
     auto label = non_hbm_labels[label_position];
@@ -2042,7 +2097,7 @@ void search_bfs_with_tiered_cache(shared_resources::configured_raft_resources& r
     raft::update_device(scratch_label_size.data_handle(), &host_label_size_u32, 1, stream);
 
     auto label_index = resolve_prefetched_or_load_bfs_label_index(
-      res, index, label, prefetched_dram_request, &prefetched_label);
+      res, index, label, prefetched_dram_request, &prefetched_label, &dram_staging_buffer);
     schedule_future_bfs_prefetch(
       index, non_hbm_labels, label_position, prefetched_dram_request, &prefetched_label);
 

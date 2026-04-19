@@ -2050,22 +2050,58 @@ void search_bfs_with_tiered_cache(shared_resources::configured_raft_resources& r
 
   if (!hbm_labels.empty()) { run_bfs_batch(hbm_labels, hbm_indices); }
 
-  std::unique_ptr<async_host_copy_request<data_t>> prefetched_dram_request;
-  uint32_t prefetched_label = UINT32_MAX;
-  reusable_device_buffer<data_t> dram_staging_buffer;
+  // --- Phase 4.3: batch DRAM labels instead of serial per-label processing ---
+  std::vector<uint32_t> dram_labels;
+  std::vector<std::shared_ptr<cuvs::neighbors::ivf_flat::index<data_t, int64_t>>> dram_indices;
+  std::vector<uint32_t> ssd_labels;
+  dram_labels.reserve(non_hbm_labels.size());
+  dram_indices.reserve(non_hbm_labels.size());
+  ssd_labels.reserve(non_hbm_labels.size());
 
-  for (std::size_t label_position = 0; label_position < non_hbm_labels.size(); ++label_position) {
-    auto label = non_hbm_labels[label_position];
-    if (label >= index.host_bfs_label_size.size()) {
+  reusable_device_buffer<data_t> dram_staging_buffer;
+  for (auto label : non_hbm_labels) {
+    if (label >= index.host_bfs_label_size.size() || label >= index.host_bfs_label_offset.size()) {
       throw std::runtime_error("Tiered BFS query label is out of bounds: " + std::to_string(label));
     }
-
     auto label_size = static_cast<int64_t>(index.host_bfs_label_size[label]);
+    auto label_offset = static_cast<int64_t>(index.host_bfs_label_offset[label]);
     if (label_size <= 0) {
       throw std::runtime_error("Tiered BFS search received a non-BFS query label " +
                                std::to_string(label));
     }
     record_bfs_label_access(res, index, label);
+
+    auto dram_bytes = bfs_label_dram_requested_bytes<data_t>(label_size, index.dataset_dim);
+    std::shared_ptr<data_t> host_storage;
+    if (index.bfs_cache != nullptr && index.bfs_dram_capacity_bytes > 0) {
+      std::lock_guard<std::mutex> lock(index.bfs_cache->dram_mutex);
+      auto cache_it = index.bfs_cache->dram_entries.find(label);
+      if (cache_it != index.bfs_cache->dram_entries.end()) {
+        index.bfs_cache->dram_lru.splice(
+          index.bfs_cache->dram_lru.begin(), index.bfs_cache->dram_lru, cache_it->second.lru_it);
+        host_storage = cache_it->second.storage;
+        index.bfs_cache->dram_hits += 1;
+      }
+    }
+    if (host_storage != nullptr) {
+      auto device_rows = dram_staging_buffer.copy_from_host(res, host_storage.get(), dram_bytes);
+      auto label_index = finalize_loaded_bfs_label(
+        res, index, label, label_offset, label_size, std::move(device_rows), false);
+      if (label_index != nullptr) {
+        dram_labels.push_back(label);
+        dram_indices.push_back(std::move(label_index));
+      }
+    } else {
+      ssd_labels.push_back(label);
+    }
+  }
+
+  if (!dram_labels.empty()) { run_bfs_batch(dram_labels, dram_indices); }
+
+  // SSD labels still use serial path (rare under warm cache)
+  for (std::size_t label_position = 0; label_position < ssd_labels.size(); ++label_position) {
+    auto label = ssd_labels[label_position];
+    auto label_size = static_cast<int64_t>(index.host_bfs_label_size[label]);
 
     auto const& host_positions = query_positions_by_label.at(label);
     auto group_size = static_cast<int64_t>(host_positions.size());
@@ -2096,10 +2132,15 @@ void search_bfs_with_tiered_cache(shared_resources::configured_raft_resources& r
     uint32_t host_label_size_u32 = static_cast<uint32_t>(label_size);
     raft::update_device(scratch_label_size.data_handle(), &host_label_size_u32, 1, stream);
 
-    auto label_index = resolve_prefetched_or_load_bfs_label_index(
-      res, index, label, prefetched_dram_request, &prefetched_label, &dram_staging_buffer);
-    schedule_future_bfs_prefetch(
-      index, non_hbm_labels, label_position, prefetched_dram_request, &prefetched_label);
+    if (index.bfs_cache != nullptr) {
+      std::lock_guard<std::mutex> lock(index.bfs_cache->access_mutex);
+      index.bfs_cache->ssd_loads += 1;
+    }
+    auto label_offset = static_cast<int64_t>(index.host_bfs_label_offset[label]);
+    auto device_rows = load_ibin_rows_to_device<data_t>(
+      res, index.bfs_dataset_cache_fname, index.bfs_total_rows, index.dataset_dim, label_offset, label_size);
+    auto label_index = finalize_loaded_bfs_label(
+      res, index, label, label_offset, label_size, std::move(device_rows));
 
     auto group_queries_view = raft::make_device_matrix_view<const data_t, int64_t, raft::row_major>(
       scratch_queries.data_handle(), group_size, query_dim);
@@ -3188,7 +3229,9 @@ void search(shared_resources::configured_raft_resources& res,
   }
 
   if (n_bfs_queries > 0) {
-    if (index.bfs_tiered_cache_enabled) {
+    bool use_direct_bfs = !index.bfs_tiered_cache_enabled ||
+                          index.ivf_bfs_index.n_lists() > 0;
+    if (!use_direct_bfs) {
       search_bfs_with_tiered_cache(
         res, index, query_info, bfs_neighbors.view(), bfs_distances.view(), topk, sample_filter);
     } else {

@@ -1210,6 +1210,23 @@ auto build(shared_resources::configured_raft_resources& res,
                                  bfs_dram_capacity_bytes);
       std::cout << "Tiered IVF-BFS cache enabled with dataset cache " << bfs_dataset_cache_fname
                 << std::endl;
+
+      // Also build the full IVF-BFS index for direct search when all data fits on GPU
+      if (std::filesystem::exists(bfs_fname) && !force_rebuild) {
+        std::cout << "Loading IVF-BFS index from " << bfs_fname << " (for direct BFS path)" << std::endl;
+        ivf_flat::deserialize(res, bfs_fname, &ivf_bfs_index);
+      } else {
+        std::cout << "Building IVF-BFS index (for direct BFS path) ..." << std::endl;
+        build_filtered_bfs(res,
+                           &ivf_bfs_index,
+                           dataset,
+                           bfs_index_map.view(),
+                           bfs_label_size.view(),
+                           bfs_label_offset.view());
+        if (!bfs_fname.empty()) {
+          ivf_flat::serialize(res, bfs_fname, ivf_bfs_index);
+        }
+      }
     } else {
       if (std::filesystem::exists(bfs_fname) && !force_rebuild) {
         std::cout << "Loading IVF-BFS index from " << bfs_fname << std::endl;

@@ -134,12 +134,23 @@ void search_filtered_bfs_impl(raft::resources const& res,
   }
 
   try {
+    using bitmap_filter_type = cuvs::neighbors::filtering::bitmap_filter<const uint32_t, int64_t>;
+    auto& sample_filter = dynamic_cast<const bitmap_filter_type&>(sample_filter_ref);
+    auto sample_filter_copy = sample_filter;
+    detail::search_filtered_bfs_core(
+      res, idx, queries, query_labels, label_size, neighbors, distances, metric, sample_filter_copy);
+    return;
+  } catch (const std::bad_cast&) {
+  }
+
+  try {
     auto& sample_filter = 
       dynamic_cast<const cuvs::neighbors::filtering::cagra_filter&>(
         sample_filter_ref);
     auto sample_filter_copy = sample_filter;
     detail::search_filtered_bfs_core(
       res, idx, queries, query_labels, label_size, neighbors, distances, metric, sample_filter_copy);
+    return;
   } catch (const std::bad_cast&) {
     RAFT_FAIL("Unsupported sample filter type");
   }

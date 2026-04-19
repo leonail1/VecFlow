@@ -43,6 +43,11 @@ The benchmark tool uses JSON configuration files for flexibility:
   "phoenix_label_dataset_dram_cache_bytes": 0,
   "phoenix_label_dataset_prefetch_max_bytes": 0,
   "phoenix_label_rebalance_interval_queries": 64,
+  "bfs_hbm_cache_bytes": 0,
+  "bfs_dram_cache_bytes": 0,
+  "bfs_prefetch_max_bytes": 0,
+  "bfs_rebalance_interval_queries": 64,
+  "cascade_eviction": true,
   "query_offset": 0,
   "query_count": -1,
   "query_id_list_file": "",
@@ -86,6 +91,11 @@ Use the same JSON structure, but set `algorithms_to_run` to `vecflow_mg` / `vecf
 - `phoenix_label_dataset_dram_cache_bytes`: Optional. Pinned-host DRAM budget for evicted or prefetched packed label-local datasets.
 - `phoenix_label_dataset_prefetch_max_bytes`: Optional. Maximum label-dataset byte size eligible for asynchronous prefetch. If unset, it falls back to the graph-prefetch budget.
 - `phoenix_label_rebalance_interval_queries`: Optional. Period for Phoenix tier rebalancing based on `access_count / bytes`.
+- `bfs_hbm_cache_bytes`: Optional. HBM budget for the low-specificity BFS path. When any BFS tiered-cache field is present, VecFlow switches the BFS path to label-local SSD/DRAM/HBM loading instead of building one monolithic in-HBM IVF-BFS index.
+- `bfs_dram_cache_bytes`: Optional. Pinned-host DRAM budget for evicted BFS labels.
+- `bfs_prefetch_max_bytes`: Optional. Maximum BFS label byte size eligible for one-label-ahead DRAM prefetch into HBM.
+- `bfs_rebalance_interval_queries`: Optional. Period for BFS HBM/DRAM tier rebalancing based on `access_count / bytes`.
+- `cascade_eviction`: Optional. Global switch for HBM-to-DRAM cascade eviction on both CAGRA and BFS paths. When `false`, HBM eviction falls back to direct deletion.
 - `query_offset`: Optional absolute query start offset for worker-style slicing
 - `query_count`: Optional query count for worker-style slicing (`-1` means use the rest)
 - `query_id_list_file`: Optional text file with one absolute query id per line. When set, `VECFLOW_BENCH` runs exactly this non-contiguous query subset.
@@ -184,6 +194,9 @@ If
 `phoenix_label_rebalance_interval_queries > 0`, it periodically rebalances HBM/DRAM tiers using
 an `access_count / bytes` score and prints score-based eviction / promotion messages for both graph
 and dataset caches.
+If any `bfs_*` tiered-cache field is present, the worker also writes a packed BFS dataset cache to
+SSD, pre-populates HBM/DRAM by label size, and serves low-specificity labels through per-label
+HBM indexes backed by DRAM/SSD reloads instead of one fully resident IVF-BFS structure.
 `VECFLOW_MG_BENCH` forwards the Phoenix-related fields into each worker config as well.
 
 When `VECFLOW_MG_BENCH` is given shared cache filenames that do not exist yet, it now launches one

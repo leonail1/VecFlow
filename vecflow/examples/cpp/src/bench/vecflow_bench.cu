@@ -8,10 +8,13 @@
 
 #include <chrono>
 #include <nlohmann/json.hpp>
+#include <atomic>
 #include <bitset>
 #include <cctype>
+#include <cmath>
 #include <vector>
 #include <algorithm>
+#include <functional>
 #include <unordered_set>
 #include <iomanip>
 #include <limits>
@@ -19,6 +22,11 @@
 #include <optional>
 #include <thread>
 #include <string>
+
+#ifdef VECFLOW_BENCH_PROGRESS_LOG
+#include <cstdio>
+#include <cinttypes>
+#endif
 
 #include "../common.cuh"
 
@@ -190,6 +198,349 @@ double compute_recall_host(const std::vector<uint32_t>& neighbors,
     total_recall += static_cast<double>(matches) / static_cast<double>(topk);
   }
   return total_recall / static_cast<double>(n_queries);
+}
+
+struct latency_summary {
+  double total_ms = 0.0;
+  double avg_ms   = 0.0;
+  double p50_ms   = 0.0;
+  double p95_ms   = 0.0;
+  double max_ms   = 0.0;
+};
+
+struct dynamic_run_policy {
+  int min_num_runs = 0;
+  int max_num_runs = 0;
+  int stability_window = 0;
+  int stable_subset_size = 0;
+  double qps_rel_tol = 0.0;
+  double latency_rel_tol = 0.0;
+  double trend_guard_rel_tol = 0.0;
+};
+
+struct dynamic_stability_result {
+  bool triggered = false;
+  std::vector<int> subset_run_numbers;
+  double subset_mean_qps = 0.0;
+  double subset_mean_latency_ms = 0.0;
+  double qps_rel_span = 0.0;
+  double latency_rel_span = 0.0;
+};
+
+double percentile_from_sorted_samples(const std::vector<double>& sorted_samples, double percentile)
+{
+  if (sorted_samples.empty()) { return 0.0; }
+
+  auto position = percentile * static_cast<double>(sorted_samples.size() - 1);
+  auto lower = static_cast<std::size_t>(position);
+  auto upper = std::min(lower + 1, sorted_samples.size() - 1);
+  auto fraction = position - static_cast<double>(lower);
+  return sorted_samples[lower] +
+         (sorted_samples[upper] - sorted_samples[lower]) * fraction;
+}
+
+latency_summary summarize_latencies_ms(const std::vector<double>& samples_ms)
+{
+  latency_summary summary;
+  if (samples_ms.empty()) { return summary; }
+
+  auto sorted_samples = samples_ms;
+  std::sort(sorted_samples.begin(), sorted_samples.end());
+  for (auto sample_ms : samples_ms) {
+    summary.total_ms += sample_ms;
+  }
+
+  summary.avg_ms = summary.total_ms / static_cast<double>(samples_ms.size());
+  summary.p50_ms = percentile_from_sorted_samples(sorted_samples, 0.50);
+  summary.p95_ms = percentile_from_sorted_samples(sorted_samples, 0.95);
+  summary.max_ms = sorted_samples.back();
+  return summary;
+}
+
+json latency_summary_to_json(const latency_summary& summary)
+{
+  return json{{"total_ms", summary.total_ms},
+              {"avg_ms", summary.avg_ms},
+              {"p50_ms", summary.p50_ms},
+              {"p95_ms", summary.p95_ms},
+              {"max_ms", summary.max_ms}};
+}
+
+double relative_span_for_subset(const std::vector<double>& samples,
+                                const std::vector<int>& subset_indices,
+                                double* mean_out)
+{
+  if (subset_indices.empty()) {
+    if (mean_out != nullptr) { *mean_out = 0.0; }
+    return std::numeric_limits<double>::infinity();
+  }
+
+  double sum = 0.0;
+  double min_value = std::numeric_limits<double>::infinity();
+  double max_value = 0.0;
+  for (auto index : subset_indices) {
+    auto value = samples[static_cast<std::size_t>(index)];
+    sum += value;
+    min_value = std::min(min_value, value);
+    max_value = std::max(max_value, value);
+  }
+
+  auto mean = sum / static_cast<double>(subset_indices.size());
+  if (mean_out != nullptr) { *mean_out = mean; }
+
+  auto denom = std::max(std::fabs(mean), 1e-9);
+  return (max_value - min_value) / denom;
+}
+
+dynamic_stability_result evaluate_dynamic_stability(
+  const std::vector<double>& run_qps_samples,
+  const std::vector<double>& run_latency_samples_ms,
+  const dynamic_run_policy& policy)
+{
+  dynamic_stability_result result;
+  auto executed_runs = static_cast<int>(run_qps_samples.size());
+  if (executed_runs < policy.min_num_runs || executed_runs <= 0) { return result; }
+
+  auto window = std::min(policy.stability_window, executed_runs);
+  if (window <= 0 || policy.stable_subset_size <= 0 || policy.stable_subset_size > window) {
+    return result;
+  }
+
+  auto window_start = executed_runs - window;
+  std::vector<int> window_indices;
+  window_indices.reserve(static_cast<std::size_t>(window));
+  for (int i = 0; i < window; ++i) {
+    window_indices.push_back(window_start + i);
+  }
+
+  auto latest_qps = run_qps_samples.back();
+  auto latest_latency_ms = run_latency_samples_ms.back();
+  auto best_score = std::numeric_limits<double>::infinity();
+
+  std::vector<int> current_subset;
+  current_subset.reserve(static_cast<std::size_t>(policy.stable_subset_size));
+
+  std::function<void(int, int)> dfs = [&](int start, int remaining) {
+    if (remaining == 0) {
+      double subset_mean_qps = 0.0;
+      double subset_mean_latency_ms = 0.0;
+      auto qps_rel_span =
+        relative_span_for_subset(run_qps_samples, current_subset, &subset_mean_qps);
+      auto latency_rel_span =
+        relative_span_for_subset(run_latency_samples_ms, current_subset, &subset_mean_latency_ms);
+      if (qps_rel_span > policy.qps_rel_tol || latency_rel_span > policy.latency_rel_tol) {
+        return;
+      }
+
+      auto qps_guard = std::fabs(latest_qps - subset_mean_qps) /
+                       std::max(std::fabs(subset_mean_qps), 1e-9);
+      auto latency_guard = std::fabs(latest_latency_ms - subset_mean_latency_ms) /
+                           std::max(std::fabs(subset_mean_latency_ms), 1e-9);
+      if (qps_guard > policy.trend_guard_rel_tol || latency_guard > policy.trend_guard_rel_tol) {
+        return;
+      }
+
+      auto score = qps_rel_span + latency_rel_span + qps_guard + latency_guard;
+      if (score >= best_score) { return; }
+
+      best_score = score;
+      result.triggered = true;
+      result.subset_run_numbers.clear();
+      result.subset_run_numbers.reserve(current_subset.size());
+      for (auto index : current_subset) {
+        result.subset_run_numbers.push_back(index + 1);
+      }
+      result.subset_mean_qps = subset_mean_qps;
+      result.subset_mean_latency_ms = subset_mean_latency_ms;
+      result.qps_rel_span = qps_rel_span;
+      result.latency_rel_span = latency_rel_span;
+      return;
+    }
+
+    for (int i = start; i <= window - remaining; ++i) {
+      current_subset.push_back(window_indices[static_cast<std::size_t>(i)]);
+      dfs(i + 1, remaining - 1);
+      current_subset.pop_back();
+    }
+  };
+
+  dfs(0, policy.stable_subset_size);
+  return result;
+}
+
+struct vecflow_cache_counters_snapshot {
+  std::uint64_t phoenix_graph_access_events = 0;
+  std::uint64_t phoenix_graph_hbm_hits = 0;
+  std::uint64_t phoenix_graph_dram_hits = 0;
+  std::uint64_t phoenix_graph_ssd_loads = 0;
+  std::uint64_t phoenix_graph_hbm_evictions = 0;
+  std::uint64_t phoenix_graph_dram_evictions = 0;
+
+  std::uint64_t phoenix_dataset_hbm_hits = 0;
+  std::uint64_t phoenix_dataset_dram_hits = 0;
+  std::uint64_t phoenix_dataset_ssd_loads = 0;
+  std::uint64_t phoenix_dataset_hbm_evictions = 0;
+  std::uint64_t phoenix_dataset_dram_evictions = 0;
+
+  std::uint64_t bfs_access_events = 0;
+  std::uint64_t bfs_hbm_hits = 0;
+  std::uint64_t bfs_dram_hits = 0;
+  std::uint64_t bfs_ssd_loads = 0;
+  std::uint64_t bfs_hbm_evictions = 0;
+  std::uint64_t bfs_dram_evictions = 0;
+};
+
+struct strict_qps_sample {
+  double elapsed_seconds = 0.0;
+  std::int64_t queries_completed = 0;
+  vecflow_cache_counters_snapshot cache_counters{};
+};
+
+template <typename data_t>
+vecflow_cache_counters_snapshot capture_vecflow_cache_counters(const vecflow::index<data_t>& index)
+{
+  vecflow_cache_counters_snapshot snapshot;
+
+  if (index.phoenix_label_cache != nullptr) {
+    std::lock_guard<std::mutex> lock(index.phoenix_label_cache->mutex);
+    snapshot.phoenix_graph_access_events = index.phoenix_label_cache->access_events;
+    snapshot.phoenix_graph_hbm_hits = index.phoenix_label_cache->hbm_hits;
+    snapshot.phoenix_graph_dram_hits = index.phoenix_label_cache->dram_hits;
+    snapshot.phoenix_graph_ssd_loads = index.phoenix_label_cache->ssd_loads;
+    snapshot.phoenix_graph_hbm_evictions = index.phoenix_label_cache->hbm_evictions;
+    snapshot.phoenix_graph_dram_evictions = index.phoenix_label_cache->dram_evictions;
+  }
+
+  if (index.phoenix_label_dataset_cache != nullptr) {
+    std::lock_guard<std::mutex> lock(index.phoenix_label_dataset_cache->mutex);
+    snapshot.phoenix_dataset_hbm_hits = index.phoenix_label_dataset_cache->hbm_hits;
+    snapshot.phoenix_dataset_dram_hits = index.phoenix_label_dataset_cache->dram_hits;
+    snapshot.phoenix_dataset_ssd_loads = index.phoenix_label_dataset_cache->ssd_loads;
+    snapshot.phoenix_dataset_hbm_evictions = index.phoenix_label_dataset_cache->hbm_evictions;
+    snapshot.phoenix_dataset_dram_evictions =
+      index.phoenix_label_dataset_cache->dram_evictions;
+  }
+
+  if (index.bfs_cache != nullptr) {
+    std::scoped_lock lock(index.bfs_cache->hbm_mutex,
+                          index.bfs_cache->dram_mutex,
+                          index.bfs_cache->access_mutex);
+    snapshot.bfs_access_events = index.bfs_cache->access_events;
+    snapshot.bfs_hbm_hits = index.bfs_cache->hbm_hits;
+    snapshot.bfs_dram_hits = index.bfs_cache->dram_hits;
+    snapshot.bfs_ssd_loads = index.bfs_cache->ssd_loads;
+    snapshot.bfs_hbm_evictions = index.bfs_cache->hbm_evictions;
+    snapshot.bfs_dram_evictions = index.bfs_cache->dram_evictions;
+  }
+
+  return snapshot;
+}
+
+vecflow_cache_counters_snapshot subtract_vecflow_cache_counters(
+  const vecflow_cache_counters_snapshot& after,
+  const vecflow_cache_counters_snapshot& before)
+{
+  vecflow_cache_counters_snapshot delta;
+  delta.phoenix_graph_access_events =
+    after.phoenix_graph_access_events - before.phoenix_graph_access_events;
+  delta.phoenix_graph_hbm_hits = after.phoenix_graph_hbm_hits - before.phoenix_graph_hbm_hits;
+  delta.phoenix_graph_dram_hits = after.phoenix_graph_dram_hits - before.phoenix_graph_dram_hits;
+  delta.phoenix_graph_ssd_loads = after.phoenix_graph_ssd_loads - before.phoenix_graph_ssd_loads;
+  delta.phoenix_graph_hbm_evictions =
+    after.phoenix_graph_hbm_evictions - before.phoenix_graph_hbm_evictions;
+  delta.phoenix_graph_dram_evictions =
+    after.phoenix_graph_dram_evictions - before.phoenix_graph_dram_evictions;
+
+  delta.phoenix_dataset_hbm_hits =
+    after.phoenix_dataset_hbm_hits - before.phoenix_dataset_hbm_hits;
+  delta.phoenix_dataset_dram_hits =
+    after.phoenix_dataset_dram_hits - before.phoenix_dataset_dram_hits;
+  delta.phoenix_dataset_ssd_loads =
+    after.phoenix_dataset_ssd_loads - before.phoenix_dataset_ssd_loads;
+  delta.phoenix_dataset_hbm_evictions =
+    after.phoenix_dataset_hbm_evictions - before.phoenix_dataset_hbm_evictions;
+  delta.phoenix_dataset_dram_evictions =
+    after.phoenix_dataset_dram_evictions - before.phoenix_dataset_dram_evictions;
+
+  delta.bfs_access_events = after.bfs_access_events - before.bfs_access_events;
+  delta.bfs_hbm_hits = after.bfs_hbm_hits - before.bfs_hbm_hits;
+  delta.bfs_dram_hits = after.bfs_dram_hits - before.bfs_dram_hits;
+  delta.bfs_ssd_loads = after.bfs_ssd_loads - before.bfs_ssd_loads;
+  delta.bfs_hbm_evictions = after.bfs_hbm_evictions - before.bfs_hbm_evictions;
+  delta.bfs_dram_evictions = after.bfs_dram_evictions - before.bfs_dram_evictions;
+  return delta;
+}
+
+json vecflow_cache_component_to_json(std::uint64_t access_events,
+                                     std::uint64_t hbm_hits,
+                                     std::uint64_t dram_hits,
+                                     std::uint64_t ssd_loads,
+                                     std::uint64_t hbm_evictions,
+                                     std::uint64_t dram_evictions)
+{
+  return json{{"access_events", access_events},
+              {"hbm_hits", hbm_hits},
+              {"dram_hits", dram_hits},
+              {"ssd_loads", ssd_loads},
+              {"hbm_evictions", hbm_evictions},
+              {"dram_evictions", dram_evictions}};
+}
+
+json vecflow_cache_counters_to_json(const vecflow_cache_counters_snapshot& counters)
+{
+  return json{
+    {"phoenix_graph",
+     vecflow_cache_component_to_json(counters.phoenix_graph_access_events,
+                                     counters.phoenix_graph_hbm_hits,
+                                     counters.phoenix_graph_dram_hits,
+                                     counters.phoenix_graph_ssd_loads,
+                                     counters.phoenix_graph_hbm_evictions,
+                                     counters.phoenix_graph_dram_evictions)},
+    {"phoenix_dataset",
+     vecflow_cache_component_to_json(0,
+                                     counters.phoenix_dataset_hbm_hits,
+                                     counters.phoenix_dataset_dram_hits,
+                                     counters.phoenix_dataset_ssd_loads,
+                                     counters.phoenix_dataset_hbm_evictions,
+                                     counters.phoenix_dataset_dram_evictions)},
+    {"tiered_bfs",
+     vecflow_cache_component_to_json(counters.bfs_access_events,
+                                     counters.bfs_hbm_hits,
+                                     counters.bfs_dram_hits,
+                                     counters.bfs_ssd_loads,
+                                     counters.bfs_hbm_evictions,
+                                     counters.bfs_dram_evictions)}};
+}
+
+json strict_qps_sample_to_json(const strict_qps_sample& sample)
+{
+  return json{{"elapsed_seconds", sample.elapsed_seconds},
+              {"queries_completed", sample.queries_completed},
+              {"cache_counters", vecflow_cache_counters_to_json(sample.cache_counters)}};
+}
+
+json storage_tier_stats_to_json(const vecflow::storage_tier_stats& stats)
+{
+  return json{{"labels", stats.labels}, {"bytes", stats.bytes}};
+}
+
+json storage_component_stats_to_json(const vecflow::storage_component_stats& stats)
+{
+  return json{{"hbm", storage_tier_stats_to_json(stats.hbm)},
+              {"dram", storage_tier_stats_to_json(stats.dram)},
+              {"ssd", storage_tier_stats_to_json(stats.ssd)},
+              {"resident_hbm", storage_tier_stats_to_json(stats.resident_hbm)},
+              {"resident_dram", storage_tier_stats_to_json(stats.resident_dram)},
+              {"total_labels", stats.total_labels},
+              {"total_bytes", stats.total_bytes}};
+}
+
+json storage_stats_info_to_json(const vecflow::storage_stats_info& stats)
+{
+  return json{{"graph", storage_component_stats_to_json(stats.graph)},
+              {"dataset", storage_component_stats_to_json(stats.dataset)},
+              {"bfs", storage_component_stats_to_json(stats.bfs)},
+              {"access_events", stats.access_events}};
 }
 
 std::vector<vecflow_mg_device_context> build_vecflow_mg_contexts(
@@ -684,6 +1035,13 @@ int main(int argc, char** argv) {
 	int topk;
 	int num_runs;
 	int warmup_runs;
+	int min_num_runs;
+	int max_num_runs;
+	int stability_window;
+	int stable_subset_size;
+	double qps_stability_rel_tol;
+	double latency_stability_rel_tol;
+	double trend_guard_rel_tol;
 	bool force_rebuild = false;
 	int tagore_iterations = 10;
   bool use_phoenix_graph_load = false;
@@ -695,12 +1053,22 @@ int main(int argc, char** argv) {
   std::uint64_t phoenix_label_dataset_dram_cache_bytes = 0;
   std::uint64_t phoenix_label_dataset_prefetch_max_bytes = 0;
   std::uint64_t phoenix_label_rebalance_interval_queries = 64;
+  bool enable_bfs_tiered_cache = false;
+  std::uint64_t bfs_hbm_cache_bytes = 0;
+  std::uint64_t bfs_dram_cache_bytes = 0;
+  std::uint64_t bfs_prefetch_max_bytes = 0;
+  std::uint64_t bfs_rebalance_interval_queries = 64;
+  bool cascade_eviction = true;
 	std::vector<std::string> algorithms_to_run;
   std::vector<int> device_ids{0};
   int64_t query_offset = 0;
   int64_t query_count = -1;
   std::string query_id_list_file;
   std::string allowed_labels_file;
+  std::string query_label_mode = "single";
+  bool skip_recall = false;
+  bool strict_qps_sampling_enabled = false;
+  double strict_qps_sampling_interval_seconds = 1.0;
 	std::string output_json_file;
 
 	// Load configuration from file
@@ -727,6 +1095,13 @@ int main(int argc, char** argv) {
 		topk = config["topk"];
 		num_runs = config["num_runs"];
 		warmup_runs = config["warmup_runs"];
+		min_num_runs = config.value("min_num_runs", num_runs);
+		max_num_runs = config.value("max_num_runs", num_runs);
+		stability_window = config.value("stability_window", max_num_runs);
+		stable_subset_size = config.value("stable_subset_size", min_num_runs);
+		qps_stability_rel_tol = config.value("qps_stability_rel_tol", 0.0);
+		latency_stability_rel_tol = config.value("latency_stability_rel_tol", 0.0);
+		trend_guard_rel_tol = config.value("trend_guard_rel_tol", qps_stability_rel_tol);
 		force_rebuild = config["force_rebuild"];
 
 		ivf_graph_fname = config["ivf_graph_fname"];
@@ -754,6 +1129,19 @@ int main(int argc, char** argv) {
       static_cast<std::uint64_t>(phoenix_label_prefetch_max_bytes));
     phoenix_label_rebalance_interval_queries = config.value(
       "phoenix_label_rebalance_interval_queries", static_cast<std::uint64_t>(64));
+    enable_bfs_tiered_cache = config.contains("bfs_hbm_cache_bytes") ||
+                              config.contains("bfs_dram_cache_bytes") ||
+                              config.contains("bfs_prefetch_max_bytes") ||
+                              config.contains("bfs_rebalance_interval_queries");
+    bfs_hbm_cache_bytes =
+      config.value("bfs_hbm_cache_bytes", static_cast<std::uint64_t>(0));
+    bfs_dram_cache_bytes =
+      config.value("bfs_dram_cache_bytes", static_cast<std::uint64_t>(0));
+    bfs_prefetch_max_bytes =
+      config.value("bfs_prefetch_max_bytes", static_cast<std::uint64_t>(0));
+    bfs_rebalance_interval_queries = config.value(
+      "bfs_rebalance_interval_queries", static_cast<std::uint64_t>(64));
+    cascade_eviction = config.value("cascade_eviction", true);
 
 		// Load new parameters
 		algorithms_to_run = config["algorithms_to_run"].get<std::vector<std::string>>();
@@ -762,6 +1150,11 @@ int main(int argc, char** argv) {
 		query_count = config.value("query_count", static_cast<int64_t>(-1));
 		query_id_list_file = config.value("query_id_list_file", std::string{});
 		allowed_labels_file = config.value("allowed_labels_file", std::string{});
+		query_label_mode = config.value("query_label_mode", std::string{"single"});
+    skip_recall = config.value("skip_recall", false);
+    strict_qps_sampling_enabled = config.value("strict_qps_sampling_enabled", false);
+    strict_qps_sampling_interval_seconds =
+      config.value("strict_qps_sampling_interval_seconds", 1.0);
 		output_json_file = config["output_json_file"];
 
 	} catch (const std::exception& e) {
@@ -783,6 +1176,42 @@ int main(int argc, char** argv) {
             "Run that binary with the same config instead of VECFLOW_BENCH.\n");
     return 1;
   }
+
+  bool use_multi_label_search = false;
+  auto multi_label_combine_mode = vecflow::multi_label_query_desc::combine_mode::OR;
+  auto multi_label_and_mode = vecflow::multi_label_query_desc::and_strategy::GREEDY;
+  auto ground_truth_label_mode = query_label_match_mode::ANY;
+  if (query_label_mode == "single") {
+    use_multi_label_search = false;
+  } else if (query_label_mode == "multi_or") {
+    use_multi_label_search = true;
+    multi_label_combine_mode = vecflow::multi_label_query_desc::combine_mode::OR;
+    ground_truth_label_mode = query_label_match_mode::ANY;
+  } else if (query_label_mode == "multi_and_greedy") {
+    use_multi_label_search = true;
+    multi_label_combine_mode = vecflow::multi_label_query_desc::combine_mode::AND;
+    multi_label_and_mode = vecflow::multi_label_query_desc::and_strategy::GREEDY;
+    ground_truth_label_mode = query_label_match_mode::ALL;
+  } else if (query_label_mode == "multi_and_parallel") {
+    use_multi_label_search = true;
+    multi_label_combine_mode = vecflow::multi_label_query_desc::combine_mode::AND;
+    multi_label_and_mode = vecflow::multi_label_query_desc::and_strategy::PARALLEL;
+    ground_truth_label_mode = query_label_match_mode::ALL;
+  } else {
+    fprintf(stderr, "Error: unsupported query_label_mode '%s'.\n", query_label_mode.c_str());
+    return 1;
+  }
+
+  if (use_multi_label_search) {
+    for (auto const& algorithm : algorithms_to_run) {
+      if (algorithm != "vecflow" && algorithm != "vecflow_tagore") {
+        fprintf(stderr,
+                "Error: query_label_mode=%s currently supports only vecflow/vecflow_tagore.\n",
+                query_label_mode.c_str());
+        return 1;
+      }
+    }
+  }
 	// Sort itopk_sizes for potentially clearer output, though not strictly necessary
 	std::sort(itopk_sizes.begin(), itopk_sizes.end());
 
@@ -796,6 +1225,12 @@ int main(int argc, char** argv) {
 	std::string full_ivf_bfs_fname = data_dir + ivf_bfs_fname;
 	std::string full_cagra_index_fname = data_dir + cagra_index_fname;
 	std::string full_ground_truth_fname = data_dir + ground_truth_fname;
+  if (use_multi_label_search) {
+    full_ground_truth_fname = append_suffix_to_filename(
+      full_ground_truth_fname,
+      ground_truth_label_mode == query_label_match_mode::ALL ? "_labelmatch_all"
+                                                             : "_labelmatch_any");
+  }
 
 	// Print configuration
 	printf("\n=== Configuration ===\n");
@@ -807,6 +1242,13 @@ int main(int argc, char** argv) {
 	printf("TopK: %d\n", topk);
 	printf("Number of runs: %d\n", num_runs);
 	printf("Warmup runs: %d\n", warmup_runs);
+	printf("Min benchmark runs: %d\n", min_num_runs);
+	printf("Max benchmark runs: %d\n", max_num_runs);
+	printf("Stability window: %d\n", stability_window);
+	printf("Stable subset size: %d\n", stable_subset_size);
+	printf("QPS stability relative tolerance: %.4f\n", qps_stability_rel_tol);
+	printf("Latency stability relative tolerance: %.4f\n", latency_stability_rel_tol);
+	printf("Trend guard relative tolerance: %.4f\n", trend_guard_rel_tol);
 	printf("Tagore iterations: %d\n", tagore_iterations);
   printf("Use Phoenix graph load: %s\n", use_phoenix_graph_load ? "true" : "false");
   printf("Use Phoenix label load: %s\n", use_phoenix_label_load ? "true" : "false");
@@ -824,6 +1266,16 @@ int main(int argc, char** argv) {
          static_cast<unsigned long long>(phoenix_label_dataset_prefetch_max_bytes));
   printf("Phoenix label rebalance interval queries: %llu\n",
          static_cast<unsigned long long>(phoenix_label_rebalance_interval_queries));
+  printf("Enable BFS tiered cache: %s\n", enable_bfs_tiered_cache ? "true" : "false");
+  printf("BFS HBM cache bytes: %llu\n",
+         static_cast<unsigned long long>(bfs_hbm_cache_bytes));
+  printf("BFS DRAM cache bytes: %llu\n",
+         static_cast<unsigned long long>(bfs_dram_cache_bytes));
+  printf("BFS prefetch max bytes: %llu\n",
+         static_cast<unsigned long long>(bfs_prefetch_max_bytes));
+  printf("BFS rebalance interval queries: %llu\n",
+         static_cast<unsigned long long>(bfs_rebalance_interval_queries));
+  printf("Cascade eviction: %s\n", cascade_eviction ? "true" : "false");
   printf("Device IDs: [ ");
   for (auto device_id : device_ids) { printf("%d ", device_id); }
   printf("]\n");
@@ -833,60 +1285,79 @@ int main(int argc, char** argv) {
   if (!allowed_labels_file.empty()) {
     printf("Allowed labels file: %s\n", allowed_labels_file.c_str());
   }
+  printf("Query label mode: %s\n", query_label_mode.c_str());
+	printf("Strict QPS sampling enabled: %s\n",
+	       strict_qps_sampling_enabled ? "true" : "false");
+	printf("Strict QPS sampling interval seconds: %.3f\n",
+	       strict_qps_sampling_interval_seconds);
 	printf("Algorithms to run: [ ");
 	for(const auto& algo : algorithms_to_run) { printf("%s ", algo.c_str()); }
 	printf("]\n");
 	printf("Output JSON file: %s\n", output_json_file.c_str());
 
-  if (use_phoenix_label_load) {
-    auto cache_bytes_string = std::to_string(phoenix_label_cache_bytes);
-    auto dram_cache_bytes_string = std::to_string(phoenix_label_dram_cache_bytes);
-    auto prefetch_bytes_string = std::to_string(phoenix_label_prefetch_max_bytes);
-    auto dataset_cache_bytes_string = std::to_string(phoenix_label_dataset_cache_bytes);
-    auto dataset_dram_cache_bytes_string =
-      std::to_string(phoenix_label_dataset_dram_cache_bytes);
-    auto dataset_prefetch_bytes_string =
-      std::to_string(phoenix_label_dataset_prefetch_max_bytes);
-    auto rebalance_interval_string = std::to_string(phoenix_label_rebalance_interval_queries);
-    ::setenv("CUVS_VECFLOW_USE_PHOENIX_LABEL_LOAD", "1", 1);
-    ::setenv("CUVS_VECFLOW_PHOENIX_LABEL_CACHE_BYTES", cache_bytes_string.c_str(), 1);
-    ::setenv("CUVS_VECFLOW_PHOENIX_LABEL_DRAM_CACHE_BYTES", dram_cache_bytes_string.c_str(), 1);
-    ::setenv(
-      "CUVS_VECFLOW_PHOENIX_LABEL_PREFETCH_MAX_BYTES", prefetch_bytes_string.c_str(), 1);
-    ::setenv("CUVS_VECFLOW_PHOENIX_LABEL_DATASET_CACHE_BYTES",
-             dataset_cache_bytes_string.c_str(),
-             1);
-    ::setenv("CUVS_VECFLOW_PHOENIX_LABEL_DATASET_DRAM_CACHE_BYTES",
-             dataset_dram_cache_bytes_string.c_str(),
-             1);
-    ::setenv("CUVS_VECFLOW_PHOENIX_LABEL_DATASET_PREFETCH_MAX_BYTES",
-             dataset_prefetch_bytes_string.c_str(),
-             1);
-    ::setenv("CUVS_VECFLOW_PHOENIX_LABEL_REBALANCE_INTERVAL_QUERIES",
-             rebalance_interval_string.c_str(),
-             1);
-    ::unsetenv("CUVS_VECFLOW_USE_PHOENIX_GRAPH_LOAD");
-  } else if (use_phoenix_graph_load) {
-    ::setenv("CUVS_VECFLOW_USE_PHOENIX_GRAPH_LOAD", "1", 1);
-    ::unsetenv("CUVS_VECFLOW_USE_PHOENIX_LABEL_LOAD");
-    ::unsetenv("CUVS_VECFLOW_PHOENIX_LABEL_CACHE_BYTES");
-    ::unsetenv("CUVS_VECFLOW_PHOENIX_LABEL_DRAM_CACHE_BYTES");
-    ::unsetenv("CUVS_VECFLOW_PHOENIX_LABEL_PREFETCH_MAX_BYTES");
-    ::unsetenv("CUVS_VECFLOW_PHOENIX_LABEL_DATASET_CACHE_BYTES");
-    ::unsetenv("CUVS_VECFLOW_PHOENIX_LABEL_DATASET_DRAM_CACHE_BYTES");
-    ::unsetenv("CUVS_VECFLOW_PHOENIX_LABEL_DATASET_PREFETCH_MAX_BYTES");
-    ::unsetenv("CUVS_VECFLOW_PHOENIX_LABEL_REBALANCE_INTERVAL_QUERIES");
-  } else {
-    ::unsetenv("CUVS_VECFLOW_USE_PHOENIX_GRAPH_LOAD");
-    ::unsetenv("CUVS_VECFLOW_USE_PHOENIX_LABEL_LOAD");
-    ::unsetenv("CUVS_VECFLOW_PHOENIX_LABEL_CACHE_BYTES");
-    ::unsetenv("CUVS_VECFLOW_PHOENIX_LABEL_DRAM_CACHE_BYTES");
-    ::unsetenv("CUVS_VECFLOW_PHOENIX_LABEL_PREFETCH_MAX_BYTES");
-    ::unsetenv("CUVS_VECFLOW_PHOENIX_LABEL_DATASET_CACHE_BYTES");
-    ::unsetenv("CUVS_VECFLOW_PHOENIX_LABEL_DATASET_DRAM_CACHE_BYTES");
-    ::unsetenv("CUVS_VECFLOW_PHOENIX_LABEL_DATASET_PREFETCH_MAX_BYTES");
-    ::unsetenv("CUVS_VECFLOW_PHOENIX_LABEL_REBALANCE_INTERVAL_QUERIES");
+  if (strict_qps_sampling_interval_seconds <= 0.0) {
+    fprintf(stderr, "Error: strict_qps_sampling_interval_seconds must be > 0.\n");
+    return 1;
   }
+
+  if (min_num_runs <= 0) {
+    fprintf(stderr, "Error: min_num_runs must be positive.\n");
+    return 1;
+  }
+  if (max_num_runs < min_num_runs) {
+    fprintf(stderr, "Error: max_num_runs must be >= min_num_runs.\n");
+    return 1;
+  }
+  if (num_runs != max_num_runs) {
+    printf("Overriding legacy num_runs=%d with max_num_runs=%d for execution control.\n",
+           num_runs,
+           max_num_runs);
+  }
+  num_runs = max_num_runs;
+  if (stability_window < stable_subset_size) { stability_window = stable_subset_size; }
+  if (stability_window < min_num_runs) { stability_window = min_num_runs; }
+
+  dynamic_run_policy dynamic_policy;
+  dynamic_policy.min_num_runs = min_num_runs;
+  dynamic_policy.max_num_runs = max_num_runs;
+  dynamic_policy.stability_window = stability_window;
+  dynamic_policy.stable_subset_size = stable_subset_size;
+  dynamic_policy.qps_rel_tol = qps_stability_rel_tol;
+  dynamic_policy.latency_rel_tol = latency_stability_rel_tol;
+  dynamic_policy.trend_guard_rel_tol = trend_guard_rel_tol;
+
+  vecflow::runtime_config runtime_config;
+  runtime_config.cascade_eviction      = cascade_eviction;
+  runtime_config.enable_bfs_tiered_cache = enable_bfs_tiered_cache;
+  runtime_config.use_phoenix_label_load = use_phoenix_label_load;
+  runtime_config.use_phoenix_graph_load = use_phoenix_label_load ? false : use_phoenix_graph_load;
+
+  if (enable_bfs_tiered_cache) {
+    runtime_config.bfs_hbm_cache_bytes             = static_cast<std::size_t>(bfs_hbm_cache_bytes);
+    runtime_config.bfs_dram_cache_bytes            = static_cast<std::size_t>(bfs_dram_cache_bytes);
+    runtime_config.bfs_prefetch_max_bytes          = static_cast<std::size_t>(bfs_prefetch_max_bytes);
+    runtime_config.bfs_rebalance_interval_queries  =
+      static_cast<std::size_t>(bfs_rebalance_interval_queries);
+  }
+
+  if (use_phoenix_label_load) {
+    runtime_config.phoenix_label_cache_bytes =
+      static_cast<std::size_t>(phoenix_label_cache_bytes);
+    runtime_config.phoenix_label_dram_cache_bytes =
+      static_cast<std::size_t>(phoenix_label_dram_cache_bytes);
+    runtime_config.phoenix_label_prefetch_max_bytes =
+      static_cast<std::size_t>(phoenix_label_prefetch_max_bytes);
+    runtime_config.phoenix_label_dataset_cache_bytes =
+      static_cast<std::size_t>(phoenix_label_dataset_cache_bytes);
+    runtime_config.phoenix_label_dataset_dram_cache_bytes =
+      static_cast<std::size_t>(phoenix_label_dataset_dram_cache_bytes);
+    runtime_config.phoenix_label_dataset_prefetch_max_bytes =
+      static_cast<std::size_t>(phoenix_label_dataset_prefetch_max_bytes);
+    runtime_config.phoenix_label_rebalance_interval_queries =
+      static_cast<std::size_t>(phoenix_label_rebalance_interval_queries);
+  }
+
+  vecflow::scoped_runtime_config runtime_config_scope(runtime_config);
 
 	std::vector<float> h_data;
 	std::vector<float> h_queries;
@@ -959,6 +1430,7 @@ int main(int argc, char** argv) {
   printf("Query range: [%lld, %lld)\n",
          static_cast<long long>(query_offset),
          static_cast<long long>(query_offset + static_cast<int64_t>(Nq)));
+  printf("Skip recall: %s\n", skip_recall ? "true" : "false");
 
 	shared_resources::configured_raft_resources res;
 
@@ -970,13 +1442,29 @@ int main(int argc, char** argv) {
 	auto d_queries = raft::make_device_matrix<float, int64_t>(res, Nq, dim);
 	raft::copy(d_queries.data_handle(), h_queries.data(), Nq * dim, stream);
 
-	// Prepare query labels (taking the first label if available, UINT32_MAX otherwise)
+	for (auto& labels : query_label_vecs) {
+		std::sort(labels.begin(), labels.end());
+		labels.erase(std::unique(labels.begin(), labels.end()), labels.end());
+	}
+
+	// Prepare query labels for both the legacy single-label path and multi-label CSR path.
 	std::vector<uint32_t> h_query_labels(Nq);
+  std::vector<int64_t> h_query_label_offsets(static_cast<std::size_t>(Nq) + 1, 0);
+  std::vector<uint32_t> h_query_label_indices;
+  h_query_label_indices.reserve(static_cast<std::size_t>(Nq) * 2);
   int64_t filtered_out_queries = 0;
 	for (int64_t i = 0; i < Nq; ++i) {
 		h_query_labels[i] =
       query_label_vecs[i].empty() ? UINT32_MAX : static_cast<uint32_t>(query_label_vecs[i][0]);
     filtered_out_queries += (h_query_labels[i] == UINT32_MAX) ? 1 : 0;
+    h_query_label_offsets[static_cast<std::size_t>(i)] =
+      static_cast<int64_t>(h_query_label_indices.size());
+    for (auto label : query_label_vecs[i]) {
+      if (label < 0) { continue; }
+      h_query_label_indices.push_back(static_cast<uint32_t>(label));
+    }
+    h_query_label_offsets[static_cast<std::size_t>(i) + 1] =
+      static_cast<int64_t>(h_query_label_indices.size());
 	}
   if (filtered_out_queries > 0) {
     printf("Queries with no remaining labels after filtering: %lld. "
@@ -986,20 +1474,48 @@ int main(int argc, char** argv) {
 	auto d_query_labels_main = raft::make_device_vector<uint32_t, int64_t>(res, Nq);
 	raft::copy(d_query_labels_main.data_handle(), h_query_labels.data(), Nq, stream);
 
-  auto gt_neighbors = raft::make_device_matrix<uint32_t, int64_t>(res, Nq, topk);
-	generate_ground_truth(res,
-												raft::make_const_mdspan(d_data.view()),
-												raft::make_const_mdspan(d_queries.view()),
-												label_data_vecs,
-												query_label_vecs,
-												gt_neighbors.view(),
-												full_ground_truth_fname);
-  std::vector<uint32_t> h_gt_neighbors(static_cast<size_t>(Nq) * topk);
-  raft::copy(h_gt_neighbors.data(),
-             gt_neighbors.data_handle(),
-             static_cast<int64_t>(Nq) * topk,
-             stream);
-  raft::resource::sync_stream(res);
+  std::optional<vecflow::multi_label_query_desc> d_multi_query_labels;
+  if (use_multi_label_search) {
+    d_multi_query_labels.emplace(vecflow::multi_label_query_desc{
+      raft::make_device_vector<int64_t, int64_t>(res, static_cast<int64_t>(h_query_label_offsets.size())),
+      raft::make_device_vector<uint32_t, int64_t>(res, static_cast<int64_t>(h_query_label_indices.size())),
+      h_query_label_offsets,
+      h_query_label_indices,
+      multi_label_combine_mode,
+      multi_label_and_mode});
+    raft::copy(d_multi_query_labels->label_offsets.data_handle(),
+               h_query_label_offsets.data(),
+               static_cast<int64_t>(h_query_label_offsets.size()),
+               stream);
+    if (!h_query_label_indices.empty()) {
+      raft::copy(d_multi_query_labels->label_indices.data_handle(),
+                 h_query_label_indices.data(),
+                 static_cast<int64_t>(h_query_label_indices.size()),
+                 stream);
+    }
+  }
+
+  std::optional<raft::device_matrix<uint32_t, int64_t>> gt_neighbors = std::nullopt;
+  std::vector<uint32_t> h_gt_neighbors;
+  if (!skip_recall) {
+    gt_neighbors.emplace(raft::make_device_matrix<uint32_t, int64_t>(res, Nq, topk));
+	  generate_ground_truth(res,
+									raft::make_const_mdspan(d_data.view()),
+									raft::make_const_mdspan(d_queries.view()),
+									label_data_vecs,
+									query_label_vecs,
+									gt_neighbors->view(),
+									full_ground_truth_fname,
+                          ground_truth_label_mode);
+    h_gt_neighbors.resize(static_cast<size_t>(Nq) * topk);
+    raft::copy(h_gt_neighbors.data(),
+               gt_neighbors->data_handle(),
+               static_cast<int64_t>(Nq) * topk,
+               stream);
+    raft::resource::sync_stream(res);
+  } else {
+    printf("Skipping ground truth generation and recall computation as configured.\n");
+  }
 
 	// Initialize the JSON array for results
 	json results_json = json::array();
@@ -1027,38 +1543,172 @@ int main(int argc, char** argv) {
     auto vecflow_neighbors = raft::make_device_matrix<uint32_t, int64_t>(res, Nq, topk);
     auto vecflow_distances = raft::make_device_matrix<float, int64_t>(res, Nq, topk);
 
+    auto run_search_once = [&](int current_itopk) {
+      if (use_multi_label_search) {
+        if (!d_multi_query_labels.has_value()) {
+          throw std::runtime_error("query_label_mode requires multi-label query descriptors");
+        }
+        vecflow::search(res,
+                        idx,
+                        raft::make_const_mdspan(d_queries.view()),
+                        *d_multi_query_labels,
+                        current_itopk,
+                        vecflow_neighbors.view(),
+                        vecflow_distances.view());
+      } else {
+        vecflow::search(res,
+                        idx,
+                        raft::make_const_mdspan(d_queries.view()),
+                        d_query_labels_main.view(),
+                        current_itopk,
+                        vecflow_neighbors.view(),
+                        vecflow_distances.view());
+      }
+      raft::resource::sync_stream(res);
+    };
+
     printf("\n=== %s Search Benchmarking ===\n", algorithm_name.c_str());
     for (int current_itopk : itopk_sizes) {
       printf("-- Running %s Search (itopk=%d) --\n", algorithm_name.c_str(), current_itopk);
       for (int i = 0; i < warmup_runs; i++) {
-        vecflow::search(res,
-                        idx,
-                        raft::make_const_mdspan(d_queries.view()),
-                        d_query_labels_main.view(),
-                        current_itopk,
-                        vecflow_neighbors.view(),
-                        vecflow_distances.view());
-        raft::resource::sync_stream(res);
+        run_search_once(current_itopk);
       }
-      auto start_time = std::chrono::high_resolution_clock::now();
-      for (int i = 0; i < num_runs; i++) {
-        vecflow::search(res,
-                        idx,
-                        raft::make_const_mdspan(d_queries.view()),
-                        d_query_labels_main.view(),
-                        current_itopk,
-                        vecflow_neighbors.view(),
-                        vecflow_distances.view());
-        raft::resource::sync_stream(res);
-      }
-      raft::resource::sync_stream(res);
-      auto end_time = std::chrono::high_resolution_clock::now();
 
-      auto total_time = std::chrono::duration<double>(end_time - start_time).count();
-      double qps = num_runs * Nq / total_time;
-      double recall = compute_recall(res, vecflow_neighbors.view(), gt_neighbors.view());
-      printf("  - QPS: %.2f, Recall@%d: %.4f\n", qps, topk, recall);
-      if (Nq > 0) {
+      auto cache_counters_before = capture_vecflow_cache_counters(idx);
+      std::vector<double> run_latencies_ms;
+      std::vector<double> run_gpu_latencies_ms;
+      std::vector<double> run_qps_samples;
+      run_latencies_ms.reserve(num_runs);
+      run_gpu_latencies_ms.reserve(num_runs);
+      run_qps_samples.reserve(num_runs);
+      cudaEvent_t gpu_start = nullptr;
+      cudaEvent_t gpu_end = nullptr;
+      RAFT_CUDA_TRY(cudaEventCreate(&gpu_start));
+      RAFT_CUDA_TRY(cudaEventCreate(&gpu_end));
+      dynamic_stability_result dynamic_stability;
+      bool dynamic_stop_triggered = false;
+      std::string dynamic_stop_reason = "reached max_num_runs";
+#ifdef VECFLOW_BENCH_PROGRESS_LOG
+      int64_t progress_total_queries = 0;
+      int64_t progress_next_milestone = 0;
+      {
+        auto ts_now = std::chrono::system_clock::now();
+        auto ts_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          ts_now.time_since_epoch()).count();
+        fprintf(stderr, "PROGRESS q=0 ts_us=%" PRId64 "\n", ts_us);
+      }
+#endif
+      for (int i = 0; i < num_runs; i++) {
+        auto run_start = std::chrono::high_resolution_clock::now();
+        RAFT_CUDA_TRY(cudaEventRecord(gpu_start, stream));
+        run_search_once(current_itopk);
+        RAFT_CUDA_TRY(cudaEventRecord(gpu_end, stream));
+        RAFT_CUDA_TRY(cudaEventSynchronize(gpu_end));
+        auto run_end = std::chrono::high_resolution_clock::now();
+#ifdef VECFLOW_BENCH_PROGRESS_LOG
+        progress_total_queries += static_cast<int64_t>(Nq);
+        if (progress_total_queries >= progress_next_milestone) {
+          auto ts_now = std::chrono::system_clock::now();
+          auto ts_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            ts_now.time_since_epoch()).count();
+          fprintf(stderr, "PROGRESS q=%" PRId64 " ts_us=%" PRId64 "\n",
+                  progress_total_queries, ts_us);
+          progress_next_milestone = ((progress_total_queries / 10000) + 1) * 10000;
+        }
+#endif
+        auto run_ms = std::chrono::duration<double, std::milli>(run_end - run_start).count();
+        float gpu_ms = 0.0f;
+        RAFT_CUDA_TRY(cudaEventElapsedTime(&gpu_ms, gpu_start, gpu_end));
+        run_latencies_ms.push_back(run_ms);
+        run_gpu_latencies_ms.push_back(static_cast<double>(gpu_ms));
+        auto run_seconds = run_ms / 1000.0;
+        auto run_qps = run_seconds > 0.0 ? static_cast<double>(Nq) / run_seconds : 0.0;
+        run_qps_samples.push_back(run_qps);
+        printf("  - Run %d/%d: qps=%.2f latency_ms=%.3f gpu_ms=%.3f\n",
+               i + 1,
+               num_runs,
+               run_qps,
+               run_ms,
+               static_cast<double>(gpu_ms));
+
+        dynamic_stability = evaluate_dynamic_stability(run_qps_samples, run_latencies_ms, dynamic_policy);
+        if (dynamic_stability.triggered && static_cast<int>(run_latencies_ms.size()) < num_runs) {
+          dynamic_stop_triggered = true;
+          dynamic_stop_reason = "stability criteria satisfied";
+          printf("  - Early stop triggered after %zu runs. Stable subset runs: [",
+                 run_latencies_ms.size());
+          for (std::size_t subset_idx = 0;
+               subset_idx < dynamic_stability.subset_run_numbers.size();
+               ++subset_idx) {
+            printf("%d%s",
+                   dynamic_stability.subset_run_numbers[subset_idx],
+                   subset_idx + 1 == dynamic_stability.subset_run_numbers.size() ? "" : " ");
+          }
+          printf("], qps span=%.2f%%, latency span=%.2f%%\n",
+                 dynamic_stability.qps_rel_span * 100.0,
+                 dynamic_stability.latency_rel_span * 100.0);
+          break;
+        }
+      }
+      RAFT_CUDA_TRY(cudaEventDestroy(gpu_start));
+      RAFT_CUDA_TRY(cudaEventDestroy(gpu_end));
+
+      auto cache_counters_after = capture_vecflow_cache_counters(idx);
+      auto cache_counter_delta =
+        subtract_vecflow_cache_counters(cache_counters_after, cache_counters_before);
+      auto latency_stats = summarize_latencies_ms(run_latencies_ms);
+      auto gpu_latency_stats = summarize_latencies_ms(run_gpu_latencies_ms);
+      std::vector<double> cpu_overhead_samples_ms;
+      cpu_overhead_samples_ms.reserve(run_latencies_ms.size());
+      for (std::size_t sample = 0; sample < run_latencies_ms.size(); ++sample) {
+        cpu_overhead_samples_ms.push_back(
+          std::max(0.0, run_latencies_ms[sample] - run_gpu_latencies_ms[sample]));
+      }
+      auto cpu_overhead_stats = summarize_latencies_ms(cpu_overhead_samples_ms);
+      auto total_time_seconds = latency_stats.total_ms / 1000.0;
+      double qps = total_time_seconds > 0.0
+                     ? static_cast<double>(num_runs) * static_cast<double>(Nq) / total_time_seconds
+                     : 0.0;
+      double recall = (!skip_recall && Nq > 0)
+                        ? compute_recall(res, vecflow_neighbors.view(), gt_neighbors->view())
+                        : 0.0;
+      auto storage_stats = vecflow::storage_stats(idx);
+      auto actual_num_runs = static_cast<int>(run_latencies_ms.size());
+      if (skip_recall) {
+        printf("  - QPS: %.2f, Recall@%d: skipped\n", qps, topk);
+      } else {
+        printf("  - QPS: %.2f, Recall@%d: %.4f\n", qps, topk, recall);
+      }
+      printf("  - Executed runs: %d (min=%d, max=%d)\n",
+             actual_num_runs,
+             min_num_runs,
+             max_num_runs);
+      printf("  - Latency(ms): total avg=%.3f p50=%.3f p95=%.3f max=%.3f\n",
+             latency_stats.avg_ms,
+             latency_stats.p50_ms,
+             latency_stats.p95_ms,
+             latency_stats.max_ms);
+      printf("  - GPU(ms): avg=%.3f p50=%.3f p95=%.3f max=%.3f\n",
+             gpu_latency_stats.avg_ms,
+             gpu_latency_stats.p50_ms,
+             gpu_latency_stats.p95_ms,
+             gpu_latency_stats.max_ms);
+      printf("  - CPU-overhead(ms): avg=%.3f p50=%.3f p95=%.3f max=%.3f\n",
+             cpu_overhead_stats.avg_ms,
+             cpu_overhead_stats.p50_ms,
+             cpu_overhead_stats.p95_ms,
+             cpu_overhead_stats.max_ms);
+      printf("  - Cache delta: graph[hbm=%llu dram=%llu ssd=%llu] dataset[hbm=%llu dram=%llu ssd=%llu] bfs[hbm=%llu dram=%llu ssd=%llu]\n",
+             static_cast<unsigned long long>(cache_counter_delta.phoenix_graph_hbm_hits),
+             static_cast<unsigned long long>(cache_counter_delta.phoenix_graph_dram_hits),
+             static_cast<unsigned long long>(cache_counter_delta.phoenix_graph_ssd_loads),
+             static_cast<unsigned long long>(cache_counter_delta.phoenix_dataset_hbm_hits),
+             static_cast<unsigned long long>(cache_counter_delta.phoenix_dataset_dram_hits),
+             static_cast<unsigned long long>(cache_counter_delta.phoenix_dataset_ssd_loads),
+             static_cast<unsigned long long>(cache_counter_delta.bfs_hbm_hits),
+             static_cast<unsigned long long>(cache_counter_delta.bfs_dram_hits),
+             static_cast<unsigned long long>(cache_counter_delta.bfs_ssd_loads));
+      if (!skip_recall && Nq > 0) {
         auto h_neighbors_dbg = raft::make_host_matrix<uint32_t, int64_t>(1, topk);
         auto h_gt_dbg = raft::make_host_matrix<uint32_t, int64_t>(1, topk);
         raft::copy(h_neighbors_dbg.data_handle(),
@@ -1066,7 +1716,7 @@ int main(int argc, char** argv) {
                    topk,
                    raft::resource::get_cuda_stream(res));
         raft::copy(h_gt_dbg.data_handle(),
-                   gt_neighbors.data_handle(),
+                   gt_neighbors->data_handle(),
                    topk,
                    raft::resource::get_cuda_stream(res));
         raft::resource::sync_stream(res);
@@ -1080,10 +1730,43 @@ int main(int argc, char** argv) {
       results_json.push_back({{"algorithm", algorithm_name},
                               {"itopk", current_itopk},
                               {"qps", qps},
-                              {"recall", recall},
+                              {"recall", skip_recall ? json(nullptr) : json(recall)},
+                              {"skip_recall", skip_recall},
+                              {"search_seconds", total_time_seconds},
+                              {"latency_ms", latency_summary_to_json(latency_stats)},
+                              {"gpu_latency_ms", latency_summary_to_json(gpu_latency_stats)},
+                              {"cpu_overhead_ms", latency_summary_to_json(cpu_overhead_stats)},
+                              {"cache_counters", vecflow_cache_counters_to_json(cache_counter_delta)},
+                              {"storage_stats", storage_stats_info_to_json(storage_stats)},
                               {"build_seconds", build_seconds},
+                              {"num_runs", actual_num_runs},
+                              {"num_runs_requested", max_num_runs},
+                              {"min_num_runs", min_num_runs},
+                              {"max_num_runs", max_num_runs},
+                              {"warmup_runs", warmup_runs},
+                              {"stability_window", stability_window},
+                              {"stable_subset_size", stable_subset_size},
+                              {"qps_stability_rel_tol", qps_stability_rel_tol},
+                              {"latency_stability_rel_tol", latency_stability_rel_tol},
+                              {"trend_guard_rel_tol", trend_guard_rel_tol},
+                              {"dynamic_stop_triggered", dynamic_stop_triggered},
+                              {"dynamic_stop_reason", dynamic_stop_reason},
+                              {"dynamic_stop_subset_runs", dynamic_stability.subset_run_numbers},
+                              {"dynamic_stop_subset_mean_qps", dynamic_stability.subset_mean_qps},
+                              {"dynamic_stop_subset_mean_latency_ms",
+                               dynamic_stability.subset_mean_latency_ms},
+                              {"dynamic_stop_qps_rel_span", dynamic_stability.qps_rel_span},
+                              {"dynamic_stop_latency_rel_span",
+                               dynamic_stability.latency_rel_span},
+                              {"run_qps_samples", run_qps_samples},
+                              {"run_latency_ms_samples", run_latencies_ms},
+                              {"run_gpu_latency_ms_samples", run_gpu_latencies_ms},
                               {"num_queries", static_cast<int64_t>(Nq)},
-                              {"query_offset", query_offset}});
+                              {"query_offset", query_offset},
+                              {"query_label_mode", query_label_mode},
+                              {"ground_truth_label_mode",
+                               ground_truth_label_mode == query_label_match_mode::ALL ? "all"
+                                                                                      : "any"}});
     }
   };
 
@@ -1145,9 +1828,14 @@ int main(int argc, char** argv) {
 
       auto total_time = std::chrono::duration<double>(end_time - start_time).count();
       double qps = num_runs * static_cast<double>(Nq) / total_time;
-      double recall = compute_recall_host(h_neighbors, h_gt_neighbors, Nq, topk);
-      printf("  - QPS: %.2f, Recall@%d: %.4f\n", qps, topk, recall);
-      if (Nq > 0) {
+      double recall = (!skip_recall && Nq > 0) ? compute_recall_host(h_neighbors, h_gt_neighbors, Nq, topk)
+                                               : 0.0;
+      if (skip_recall) {
+        printf("  - QPS: %.2f, Recall@%d: skipped\n", qps, topk);
+      } else {
+        printf("  - QPS: %.2f, Recall@%d: %.4f\n", qps, topk, recall);
+      }
+      if (!skip_recall && Nq > 0) {
         printf("  - First query neighbors: ");
         for (int j = 0; j < topk; ++j) { printf("%u ", h_neighbors[j]); }
         printf("\n");
@@ -1204,9 +1892,15 @@ int main(int argc, char** argv) {
 										d_query_labels_main.view(), label_data_vecs,
 										label_data_vecs.size(), current_itopk, topk,
 										num_runs, warmup_runs, filtered_neighbors_pp.view());
-			double recall = compute_recall(res, filtered_neighbors_pp.view(), gt_neighbors.view());
-			printf("  - QPS: %.2f, Recall@%d: %.4f\n", qps, topk, recall);
-      if (Nq > 0) {
+			double recall = (!skip_recall && Nq > 0)
+			                  ? compute_recall(res, filtered_neighbors_pp.view(), gt_neighbors->view())
+			                  : 0.0;
+			if (skip_recall) {
+				printf("  - QPS: %.2f, Recall@%d: skipped\n", qps, topk);
+			} else {
+				printf("  - QPS: %.2f, Recall@%d: %.4f\n", qps, topk, recall);
+			}
+      if (!skip_recall && Nq > 0) {
         auto h_neighbors_dbg = raft::make_host_matrix<uint32_t, int64_t>(1, topk);
         auto h_gt_dbg = raft::make_host_matrix<uint32_t, int64_t>(1, topk);
         raft::copy(h_neighbors_dbg.data_handle(),
@@ -1214,7 +1908,7 @@ int main(int argc, char** argv) {
                    topk,
                    raft::resource::get_cuda_stream(res));
         raft::copy(h_gt_dbg.data_handle(),
-                   gt_neighbors.data_handle(),
+                   gt_neighbors->data_handle(),
                    topk,
                    raft::resource::get_cuda_stream(res));
         raft::resource::sync_stream(res);
@@ -1228,7 +1922,8 @@ int main(int argc, char** argv) {
 			results_json.push_back({{"algorithm", "cagra_post_processing"},
                               {"itopk", current_itopk},
                               {"qps", qps},
-                              {"recall", recall},
+                              {"recall", skip_recall ? json(nullptr) : json(recall)},
+                              {"skip_recall", skip_recall},
                               {"num_queries", static_cast<int64_t>(Nq)},
                               {"query_offset", query_offset}});
 		}
@@ -1249,9 +1944,15 @@ int main(int argc, char** argv) {
                             d_query_labels_main.view(), label_data_vecs,
                             current_itopk, topk, num_runs, warmup_runs,
                             filtered_neighbors_inline.view());
-      double recall = compute_recall(res, filtered_neighbors_inline.view(), gt_neighbors.view());
-      printf("  - QPS: %.2f, Recall@%d: %.4f\n", qps, topk, recall);
-      if (Nq > 0) {
+      double recall = (!skip_recall && Nq > 0)
+                        ? compute_recall(res, filtered_neighbors_inline.view(), gt_neighbors->view())
+                        : 0.0;
+      if (skip_recall) {
+        printf("  - QPS: %.2f, Recall@%d: skipped\n", qps, topk);
+      } else {
+        printf("  - QPS: %.2f, Recall@%d: %.4f\n", qps, topk, recall);
+      }
+      if (!skip_recall && Nq > 0) {
         auto h_neighbors_dbg = raft::make_host_matrix<uint32_t, int64_t>(1, topk);
         auto h_gt_dbg = raft::make_host_matrix<uint32_t, int64_t>(1, topk);
         raft::copy(h_neighbors_dbg.data_handle(),
@@ -1259,7 +1960,7 @@ int main(int argc, char** argv) {
                    topk,
                    raft::resource::get_cuda_stream(res));
         raft::copy(h_gt_dbg.data_handle(),
-                   gt_neighbors.data_handle(),
+                   gt_neighbors->data_handle(),
                    topk,
                    raft::resource::get_cuda_stream(res));
         raft::resource::sync_stream(res);
@@ -1273,7 +1974,8 @@ int main(int argc, char** argv) {
       results_json.push_back({{"algorithm", "cagra_inline_filtering"},
                               {"itopk", current_itopk},
                               {"qps", qps},
-                              {"recall", recall},
+                              {"recall", skip_recall ? json(nullptr) : json(recall)},
+                              {"skip_recall", skip_recall},
                               {"num_queries", static_cast<int64_t>(Nq)},
                               {"query_offset", query_offset}});
     }

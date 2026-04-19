@@ -39,6 +39,7 @@
 #include <iomanip> 
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <thread>
 #include <type_traits>
 #include <unistd.h>
@@ -100,6 +101,7 @@ void write_packed_dataset_cache(shared_resources::configured_raft_resources& res
     auto d_row_ids = raft::make_device_vector<uint32_t, int64_t>(res, chunk_rows);
     auto d_rows = raft::make_device_matrix<data_t, int64_t>(res, chunk_rows, cols);
     std::vector<data_t> host_rows(static_cast<std::size_t>(chunk_rows * cols));
+    auto payload_checksum = kFnv1a64Offset;
 
     for (int64_t row_offset = 0; row_offset < rows; row_offset += chunk_rows) {
       auto rows_to_write = std::min<int64_t>(chunk_rows, rows - row_offset);
@@ -123,6 +125,7 @@ void write_packed_dataset_cache(shared_resources::configured_raft_resources& res
       raft::resource::sync_stream(res);
 
       auto payload_bytes = static_cast<std::size_t>(total_values) * sizeof(data_t);
+      payload_checksum = fnv1a64_update(payload_checksum, host_rows.data(), payload_bytes);
       auto payload_offset = phoenix::kIbinHeaderBytes +
                             static_cast<off_t>(row_offset * cols *
                                                static_cast<int64_t>(sizeof(data_t)));
@@ -133,6 +136,13 @@ void write_packed_dataset_cache(shared_resources::configured_raft_resources& res
     }
 
     close_file();
+    write_ibin_cache_meta(filename,
+                          ibin_cache_meta{kIbinCacheMetaMagic,
+                                          kIbinCacheMetaVersion,
+                                          static_cast<std::uint32_t>(sizeof(data_t)),
+                                          rows,
+                                          cols,
+                                          payload_checksum});
     std::cout << "Saving packed dataset cache to " << filename << std::endl;
   } catch (...) {
     close_file();
@@ -383,6 +393,34 @@ inline void populate_initial_graph_tiers(shared_resources::configured_raft_resou
   auto remaining_dram = dram_capacity_bytes;
   std::size_t hbm_labels = 0;
   std::size_t dram_labels = 0;
+  auto log_preload_progress = [&](const char* component,
+                                  const char* tier,
+                                  std::size_t count,
+                                  uint32_t label,
+                                  int64_t size) {
+    if (count <= 8 || (count % 4096) == 0) {
+      detail::phoenix::phoenix_log("Initial ",
+                                   component,
+                                   " preload ",
+                                   tier,
+                                   " count=",
+                                   count,
+                                   " label=",
+                                   label,
+                                   " size=",
+                                   size,
+                                   " remaining_hbm=",
+                                   remaining_hbm,
+                                   " remaining_dram=",
+                                   remaining_dram);
+    }
+  };
+  detail::phoenix::phoenix_log("Starting initial Phoenix graph preload candidates=",
+                               candidates.size(),
+                               " hbm_capacity=",
+                               hbm_capacity_bytes,
+                               " dram_capacity=",
+                               dram_capacity_bytes);
 
   for (auto const& candidate : candidates) {
     auto values = static_cast<std::size_t>(candidate.size) *
@@ -400,6 +438,7 @@ inline void populate_initial_graph_tiers(shared_resources::configured_raft_resou
         add_graph_to_initial_hbm_cache(cache_state, candidate.label, candidate.bytes, storage);
         remaining_hbm -= candidate.bytes;
         ++hbm_labels;
+        log_preload_progress("Phoenix graph", "HBM", hbm_labels, candidate.label, candidate.size);
       }
       continue;
     }
@@ -418,6 +457,7 @@ inline void populate_initial_graph_tiers(shared_resources::configured_raft_resou
         add_graph_to_initial_dram_cache(cache_state, candidate.label, candidate.bytes, storage);
         remaining_dram -= candidate.bytes;
         ++dram_labels;
+        log_preload_progress("Phoenix graph", "DRAM", dram_labels, candidate.label, candidate.size);
       }
     }
   }
@@ -485,6 +525,22 @@ inline void populate_initial_dataset_tiers(
   auto remaining_dram = dram_capacity_bytes;
   std::size_t hbm_labels = 0;
   std::size_t dram_labels = 0;
+  auto verbose_preload = detail::phoenix::env_truthy(std::getenv("CUVS_VECFLOW_VERBOSE"));
+  auto log_preload_progress = [&](const char* tier,
+                                  std::size_t count,
+                                  uint32_t label,
+                                  int64_t size) {
+    if (!verbose_preload || !(count <= 8 || (count % 4096) == 0)) { return; }
+    std::cout << "Initial Phoenix dataset preload " << tier << " count=" << count
+              << " label=" << label << " size=" << size
+              << " remaining_hbm=" << remaining_hbm
+              << " remaining_dram=" << remaining_dram << std::endl;
+  };
+  if (verbose_preload) {
+    std::cout << "Starting initial Phoenix dataset preload candidates=" << candidates.size()
+              << " hbm_capacity=" << hbm_capacity_bytes
+              << " dram_capacity=" << dram_capacity_bytes << std::endl;
+  }
 
   for (auto const& candidate : candidates) {
     auto row_ids = host_index_map.data() + candidate.offset;
@@ -495,6 +551,7 @@ inline void populate_initial_dataset_tiers(
         add_dataset_to_initial_hbm_cache(cache_state, candidate.label, candidate.bytes, storage);
         remaining_hbm -= candidate.bytes;
         ++hbm_labels;
+        log_preload_progress("HBM", hbm_labels, candidate.label, candidate.size);
       }
       continue;
     }
@@ -506,12 +563,211 @@ inline void populate_initial_dataset_tiers(
         add_dataset_to_initial_dram_cache(cache_state, candidate.label, candidate.bytes, storage);
         remaining_dram -= candidate.bytes;
         ++dram_labels;
+        log_preload_progress("DRAM", dram_labels, candidate.label, candidate.size);
       }
     }
   }
 
   if (hbm_labels > 0 || dram_labels > 0) {
     std::cout << "Initial Phoenix dataset placement: HBM labels=" << hbm_labels
+              << ", DRAM labels=" << dram_labels << ", SSD labels="
+              << (candidates.size() - hbm_labels - dram_labels) << std::endl;
+  }
+}
+
+template <typename data_t>
+inline auto bfs_initial_dram_bytes(int64_t label_size, int64_t dim) -> std::size_t
+{
+  return static_cast<std::size_t>(label_size) * static_cast<std::size_t>(dim) * sizeof(data_t);
+}
+
+template <typename data_t>
+inline auto bfs_initial_hbm_bytes(int64_t label_size, int64_t dim) -> std::size_t
+{
+  auto padded_size =
+    raft::ceildiv<std::size_t>(static_cast<std::size_t>(label_size),
+                               static_cast<std::size_t>(cuvs::neighbors::ivf_flat::kIndexGroupSize)) *
+    static_cast<std::size_t>(cuvs::neighbors::ivf_flat::kIndexGroupSize);
+  return padded_size * static_cast<std::size_t>(dim) * sizeof(data_t) +
+         padded_size * sizeof(int64_t);
+}
+
+template <typename data_t>
+inline auto build_initial_bfs_label_index(
+  shared_resources::configured_raft_resources& res,
+  raft::device_matrix_view<const data_t, int64_t> label_rows,
+  const uint32_t* host_index_map)
+  -> std::shared_ptr<cuvs::neighbors::ivf_flat::index<data_t, int64_t>>
+{
+  auto label_size = label_rows.extent(0);
+  if (label_size <= 0) { return {}; }
+
+  auto label_index =
+    std::make_shared<cuvs::neighbors::ivf_flat::index<data_t, int64_t>>(res);
+  auto d_index_map = raft::make_device_vector<uint32_t, int64_t>(res, label_size);
+  auto d_label_size = raft::make_device_vector<uint32_t, int64_t>(res, 1);
+  auto d_label_offset = raft::make_device_vector<uint32_t, int64_t>(res, 1);
+  auto stream = raft::resource::get_cuda_stream(res);
+  auto label_size_us = static_cast<std::size_t>(label_size);
+  uint32_t host_label_size_u32 = static_cast<uint32_t>(label_size);
+  uint32_t host_label_offset_u32 = 0;
+  std::vector<uint32_t> local_index_map(label_size_us);
+  std::iota(local_index_map.begin(), local_index_map.end(), uint32_t{0});
+  raft::update_device(d_index_map.data_handle(), local_index_map.data(), label_size, stream);
+  raft::update_device(d_label_size.data_handle(), &host_label_size_u32, 1, stream);
+  raft::update_device(d_label_offset.data_handle(), &host_label_offset_u32, 1, stream);
+  build_filtered_bfs(res,
+                     label_index.get(),
+                     raft::make_const_mdspan(label_rows),
+                     d_index_map.view(),
+                     d_label_size.view(),
+                     d_label_offset.view());
+  raft::resource::sync_stream(res);
+
+  std::vector<int64_t> global_index_map(label_size_us);
+  std::transform(host_index_map,
+                 host_index_map + label_size,
+                 global_index_map.begin(),
+                 [](uint32_t row_id) { return static_cast<int64_t>(row_id); });
+  auto list = label_index->lists()[0];
+  if (list == nullptr) { throw std::runtime_error("BFS label index list is unexpectedly null"); }
+  raft::update_device(
+    list->indices.data_handle(), global_index_map.data(), static_cast<int64_t>(label_size_us), stream);
+  cuvs::neighbors::ivf_flat::helpers::recompute_internal_state(res, label_index.get());
+  raft::resource::sync_stream(res);
+  return label_index;
+}
+
+template <typename data_t>
+inline void add_bfs_to_initial_hbm_cache(
+  const std::shared_ptr<bfs_label_cache_state<data_t>>& cache_state,
+  uint32_t label,
+  std::size_t bytes,
+  int64_t label_size,
+  const std::shared_ptr<cuvs::neighbors::ivf_flat::index<data_t, int64_t>>& label_index)
+{
+  if (cache_state == nullptr || label_index == nullptr || bytes == 0) { return; }
+  cache_state->hbm_lru.push_front(label);
+  cache_state->hbm_entries.emplace(
+    label,
+    typename bfs_label_cache_state<data_t>::cached_bfs_entry{
+      label_index, nullptr, bytes, label_size, cache_state->hbm_lru.begin()});
+  cache_state->hbm_cached_bytes += bytes;
+}
+
+template <typename data_t>
+inline void add_bfs_to_initial_dram_cache(
+  const std::shared_ptr<bfs_label_cache_state<data_t>>& cache_state,
+  uint32_t label,
+  std::size_t bytes,
+  int64_t label_size,
+  const std::shared_ptr<data_t>& storage)
+{
+  if (cache_state == nullptr || storage == nullptr || bytes == 0) { return; }
+  cache_state->dram_lru.push_front(label);
+  cache_state->dram_entries.emplace(
+    label,
+    typename bfs_label_cache_state<data_t>::cached_bfs_entry{
+      nullptr, storage, bytes, label_size, cache_state->dram_lru.begin()});
+  cache_state->dram_cached_bytes += bytes;
+}
+
+template <typename data_t>
+inline void populate_initial_bfs_tiers(
+  shared_resources::configured_raft_resources& res,
+  raft::device_matrix_view<const data_t, int64_t> dataset,
+  const std::shared_ptr<bfs_label_cache_state<data_t>>& cache_state,
+  const std::vector<uint32_t>& host_label_size,
+  const std::vector<uint32_t>& host_label_offset,
+  const std::vector<uint32_t>& host_index_map,
+  std::size_t hbm_capacity_bytes,
+  std::size_t dram_capacity_bytes)
+{
+  if (cache_state == nullptr || (hbm_capacity_bytes == 0 && dram_capacity_bytes == 0)) { return; }
+
+  struct preload_candidate {
+    uint32_t label = 0;
+    int64_t offset = 0;
+    int64_t size = 0;
+    std::size_t hbm_bytes = 0;
+    std::size_t dram_bytes = 0;
+  };
+
+  auto dim = dataset.extent(1);
+  std::vector<preload_candidate> candidates;
+  candidates.reserve(host_label_size.size());
+  for (uint32_t label = 0; label < host_label_size.size(); ++label) {
+    auto label_size = static_cast<int64_t>(host_label_size[label]);
+    if (label_size <= 0) { continue; }
+    candidates.push_back(preload_candidate{label,
+                                           static_cast<int64_t>(host_label_offset[label]),
+                                           label_size,
+                                           bfs_initial_hbm_bytes<data_t>(label_size, dim),
+                                           bfs_initial_dram_bytes<data_t>(label_size, dim)});
+  }
+
+  std::sort(candidates.begin(),
+            candidates.end(),
+            [](preload_candidate const& lhs, preload_candidate const& rhs) {
+              if (lhs.hbm_bytes != rhs.hbm_bytes) { return lhs.hbm_bytes < rhs.hbm_bytes; }
+              if (lhs.dram_bytes != rhs.dram_bytes) { return lhs.dram_bytes < rhs.dram_bytes; }
+              return lhs.label < rhs.label;
+            });
+
+  auto remaining_hbm = hbm_capacity_bytes;
+  auto remaining_dram = dram_capacity_bytes;
+  std::size_t hbm_labels = 0;
+  std::size_t dram_labels = 0;
+  auto verbose_preload = detail::phoenix::env_truthy(std::getenv("CUVS_VECFLOW_VERBOSE"));
+  auto log_preload_progress = [&](const char* tier,
+                                  std::size_t count,
+                                  uint32_t label,
+                                  int64_t size) {
+    if (!verbose_preload || !(count <= 8 || (count % 4096) == 0)) { return; }
+    std::cout << "Initial BFS preload " << tier << " count=" << count
+              << " label=" << label << " size=" << size
+              << " remaining_hbm=" << remaining_hbm
+              << " remaining_dram=" << remaining_dram << std::endl;
+  };
+  if (verbose_preload) {
+    std::cout << "Starting initial BFS preload candidates=" << candidates.size()
+              << " hbm_capacity=" << hbm_capacity_bytes
+              << " dram_capacity=" << dram_capacity_bytes << std::endl;
+  }
+
+  for (auto const& candidate : candidates) {
+    auto row_ids = host_index_map.data() + candidate.offset;
+    if (candidate.hbm_bytes <= remaining_hbm) {
+      auto storage = gather_dataset_rows_to_device_storage(res, dataset, row_ids, candidate.size);
+      if (storage != nullptr) {
+        auto rows_view = raft::make_device_matrix_view<const data_t, int64_t, raft::row_major>(
+          storage.get(), candidate.size, dim);
+        auto label_index = build_initial_bfs_label_index(res, rows_view, row_ids);
+        if (label_index != nullptr) {
+          add_bfs_to_initial_hbm_cache(
+            cache_state, candidate.label, candidate.hbm_bytes, candidate.size, label_index);
+          remaining_hbm -= candidate.hbm_bytes;
+          ++hbm_labels;
+          log_preload_progress("HBM", hbm_labels, candidate.label, candidate.size);
+          continue;
+        }
+      }
+    }
+
+    if (candidate.dram_bytes <= remaining_dram) {
+      auto storage = gather_dataset_rows_to_pinned_host_storage(res, dataset, row_ids, candidate.size);
+      if (storage != nullptr) {
+        add_bfs_to_initial_dram_cache(
+          cache_state, candidate.label, candidate.dram_bytes, candidate.size, storage);
+        remaining_dram -= candidate.dram_bytes;
+        ++dram_labels;
+        log_preload_progress("DRAM", dram_labels, candidate.label, candidate.size);
+      }
+    }
+  }
+
+  if (hbm_labels > 0 || dram_labels > 0) {
+    std::cout << "Initial BFS placement: HBM labels=" << hbm_labels
               << ", DRAM labels=" << dram_labels << ", SSD labels="
               << (candidates.size() - hbm_labels - dram_labels) << std::endl;
   }
@@ -608,6 +864,8 @@ auto build(shared_resources::configured_raft_resources& res,
   auto cagra_label_size = raft::make_device_vector<uint32_t, int64_t>(res, label_number);
   auto cagra_label_offset = raft::make_device_vector<uint32_t, int64_t>(res, label_number);
   auto bfs_label_size = raft::make_device_vector<uint32_t, int64_t>(res, label_number);
+  auto bfs_label_offset = raft::make_device_vector<uint32_t, int64_t>(res, label_number);
+  auto bfs_index_map = raft::make_device_vector<uint32_t, int64_t>(res, bfs_total_rows);
   auto d_cat_freq = raft::make_device_vector<uint32_t, int64_t>(res, label_number);
 
   raft::update_device(cagra_label_size.data_handle(), 
@@ -626,6 +884,14 @@ auto build(shared_resources::configured_raft_resources& res,
                       host_bfs_label_size.data(), 
                       label_number,
                       raft::resource::get_cuda_stream(res));
+  raft::update_device(bfs_label_offset.data_handle(),
+                      host_bfs_label_offset.data(),
+                      label_number,
+                      raft::resource::get_cuda_stream(res));
+  raft::update_device(bfs_index_map.data_handle(),
+                      host_bfs_index_map.data(),
+                      bfs_total_rows,
+                      raft::resource::get_cuda_stream(res));
   raft::update_device(d_cat_freq.data_handle(), 
                       host_cat_freq.data(), 
                       label_number,
@@ -641,15 +907,25 @@ auto build(shared_resources::configured_raft_resources& res,
   std::shared_ptr<uint32_t> cagra_graph_storage;
   auto dataset_cache_fname =
     !graph_fname.empty() ? append_suffix_to_filename(graph_fname, "_dataset") : std::string{};
+  auto bfs_dataset_cache_fname =
+    !bfs_fname.empty() ? append_suffix_to_filename(bfs_fname, "_dataset") : std::string{};
   bool deferred_phoenix_label_load = false;
   bool deferred_phoenix_dataset_load = false;
   auto use_tagore_builder = graph_builder != graph_builder_type::CAGRA;
   auto enable_phoenix_label_load = detail::phoenix::use_phoenix_label_load();
+  auto enable_bfs_tiered_cache = detail::phoenix::bfs_tiered_cache_enabled();
+  auto bfs_hbm_capacity_bytes = detail::phoenix::bfs_hbm_cache_bytes();
+  auto bfs_dram_capacity_bytes = detail::phoenix::bfs_dram_cache_bytes();
+  if (enable_bfs_tiered_cache && bfs_hbm_capacity_bytes == 0) {
+    bfs_hbm_capacity_bytes = std::numeric_limits<std::size_t>::max();
+  }
   auto graph_storage_width = graph_degree;
   auto phoenix_cache_state = std::make_shared<phoenix_label_cache_state>();
   phoenix_cache_state->access_counts.resize(label_number, 0);
   auto phoenix_dataset_cache_state =
     std::make_shared<phoenix_label_dataset_cache_state<data_t>>();
+  auto bfs_cache_state = std::make_shared<bfs_label_cache_state<data_t>>();
+  bfs_cache_state->access_counts.resize(label_number, 0);
 
   // Index Information  
   std::cout << "\n=== Index Information ===" << std::endl;
@@ -669,21 +945,36 @@ auto build(shared_resources::configured_raft_resources& res,
     auto use_cached_dataset =
       !dataset_cache_fname.empty() && std::filesystem::exists(dataset_cache_fname) && !force_rebuild;
     if (use_cached_graph) {
-      auto [cached_rows, cached_cols] = read_ibin_shape(graph_fname);
-      if (cached_rows != cagra_total_rows || cached_cols != graph_storage_width) {
-        std::cout << "Cached IVF-Graph at " << graph_fname << " has shape [" << cached_rows
-                  << " x " << cached_cols << "], expected [" << cagra_total_rows << " x "
-                  << graph_storage_width << "]. Rebuilding." << std::endl;
+      try {
+        validate_ibin_cache_meta(graph_fname, static_cast<std::uint32_t>(sizeof(uint32_t)));
+        auto [cached_rows, cached_cols] = read_ibin_shape(graph_fname);
+        if (cached_rows != cagra_total_rows || cached_cols != graph_storage_width) {
+          std::cout << "Cached IVF-Graph at " << graph_fname << " has shape [" << cached_rows
+                    << " x " << cached_cols << "], expected [" << cagra_total_rows << " x "
+                    << graph_storage_width << "]. Rebuilding." << std::endl;
+          use_cached_graph = false;
+        }
+      } catch (const std::exception& e) {
+        std::cout << "Cached IVF-Graph at " << graph_fname
+                  << " failed validation (" << e.what() << "). Rebuilding." << std::endl;
         use_cached_graph = false;
       }
     }
     if (use_cached_dataset) {
-      auto [cached_rows, cached_cols] = read_ibin_shape(dataset_cache_fname);
-      if (cached_rows != cagra_total_rows || cached_cols != dataset.extent(1)) {
-        std::cout << "Cached packed dataset at " << dataset_cache_fname << " has shape ["
-                  << cached_rows << " x " << cached_cols << "], expected ["
-                  << cagra_total_rows << " x " << dataset.extent(1) << "]. Rebuilding."
-                  << std::endl;
+      try {
+        validate_ibin_cache_meta(dataset_cache_fname,
+                                 static_cast<std::uint32_t>(sizeof(data_t)));
+        auto [cached_rows, cached_cols] = read_ibin_shape(dataset_cache_fname);
+        if (cached_rows != cagra_total_rows || cached_cols != dataset.extent(1)) {
+          std::cout << "Cached packed dataset at " << dataset_cache_fname << " has shape ["
+                    << cached_rows << " x " << cached_cols << "], expected ["
+                    << cagra_total_rows << " x " << dataset.extent(1) << "]. Rebuilding."
+                    << std::endl;
+          use_cached_dataset = false;
+        }
+      } catch (const std::exception& e) {
+        std::cout << "Cached packed dataset at " << dataset_cache_fname
+                  << " failed validation (" << e.what() << "). Rebuilding." << std::endl;
         use_cached_dataset = false;
       }
     }
@@ -879,34 +1170,67 @@ auto build(shared_resources::configured_raft_resources& res,
   }
 
   if (bfs_labels > 0) {
-    if (std::filesystem::exists(bfs_fname) && !force_rebuild) {
-      std::cout << "Loading IVF-BFS index from " << bfs_fname << std::endl;
-      ivf_flat::deserialize(res, bfs_fname, &ivf_bfs_index);
+    if (enable_bfs_tiered_cache) {
+      if (bfs_dataset_cache_fname.empty()) {
+        throw std::runtime_error(
+          "BFS tiered cache requires a non-empty BFS cache filename to back SSD rows.");
+      }
+
+      auto use_cached_bfs_dataset =
+        std::filesystem::exists(bfs_dataset_cache_fname) && !force_rebuild;
+      if (use_cached_bfs_dataset) {
+        try {
+          validate_ibin_cache_meta(bfs_dataset_cache_fname,
+                                   static_cast<std::uint32_t>(sizeof(data_t)));
+          auto [cached_rows, cached_cols] = read_ibin_shape(bfs_dataset_cache_fname);
+          if (cached_rows != bfs_total_rows || cached_cols != dataset.extent(1)) {
+            std::cout << "Cached BFS dataset at " << bfs_dataset_cache_fname << " has shape ["
+                      << cached_rows << " x " << cached_cols << "], expected [" << bfs_total_rows
+                      << " x " << dataset.extent(1) << "]. Rebuilding." << std::endl;
+            use_cached_bfs_dataset = false;
+          }
+        } catch (const std::exception& e) {
+          std::cout << "Cached BFS dataset at " << bfs_dataset_cache_fname
+                    << " failed validation (" << e.what() << "). Rebuilding." << std::endl;
+          use_cached_bfs_dataset = false;
+        }
+      }
+
+      if (!use_cached_bfs_dataset) {
+        write_packed_dataset_cache(res, dataset, host_bfs_index_map, bfs_dataset_cache_fname);
+      }
+
+      populate_initial_bfs_tiers(res,
+                                 dataset,
+                                 bfs_cache_state,
+                                 host_bfs_label_size,
+                                 host_bfs_label_offset,
+                                 host_bfs_index_map,
+                                 bfs_hbm_capacity_bytes,
+                                 bfs_dram_capacity_bytes);
+      std::cout << "Tiered IVF-BFS cache enabled with dataset cache " << bfs_dataset_cache_fname
+                << std::endl;
     } else {
-      std::cout << "Building IVF-BFS index from scratch ..." << std::endl;
-      auto bfs_label_offset = raft::make_device_vector<uint32_t, int64_t>(res, label_number);
-      auto bfs_index_map = raft::make_device_vector<uint32_t, int64_t>(res, bfs_total_rows);
-      raft::update_device(bfs_label_offset.data_handle(),
-                          host_bfs_label_offset.data(),
-                          label_number,
-                          raft::resource::get_cuda_stream(res));
-      raft::update_device(bfs_index_map.data_handle(),
-                          host_bfs_index_map.data(),
-                          bfs_total_rows,
-                          raft::resource::get_cuda_stream(res));
-      auto bfs_start_time = std::chrono::high_resolution_clock::now();                 
-      build_filtered_bfs(res,
-                         &ivf_bfs_index,
-                         dataset,
-                         bfs_index_map.view(),
-                         bfs_label_size.view(),
-                         bfs_label_offset.view());
-      auto bfs_end_time = std::chrono::high_resolution_clock::now();
-      auto bfs_duration = std::chrono::duration_cast<std::chrono::milliseconds>(bfs_end_time - bfs_start_time);
-      std::cout << "IVF-BFS graph building time: " << bfs_duration.count() << " ms" << std::endl;
-      if (!bfs_fname.empty()) {
-        ivf_flat::serialize(res, bfs_fname, ivf_bfs_index);
-        std::cout << "Saving IVF-BFS index to " << bfs_fname << std::endl;
+      if (std::filesystem::exists(bfs_fname) && !force_rebuild) {
+        std::cout << "Loading IVF-BFS index from " << bfs_fname << std::endl;
+        ivf_flat::deserialize(res, bfs_fname, &ivf_bfs_index);
+      } else {
+        std::cout << "Building IVF-BFS index from scratch ..." << std::endl;
+        auto bfs_start_time = std::chrono::high_resolution_clock::now();
+        build_filtered_bfs(res,
+                           &ivf_bfs_index,
+                           dataset,
+                           bfs_index_map.view(),
+                           bfs_label_size.view(),
+                           bfs_label_offset.view());
+        auto bfs_end_time = std::chrono::high_resolution_clock::now();
+        auto bfs_duration =
+          std::chrono::duration_cast<std::chrono::milliseconds>(bfs_end_time - bfs_start_time);
+        std::cout << "IVF-BFS graph building time: " << bfs_duration.count() << " ms" << std::endl;
+        if (!bfs_fname.empty()) {
+          ivf_flat::serialize(res, bfs_fname, ivf_bfs_index);
+          std::cout << "Saving IVF-BFS index to " << bfs_fname << std::endl;
+        }
       }
     }
   }
@@ -934,7 +1258,10 @@ auto build(shared_resources::configured_raft_resources& res,
   std::cout << "\nIVF-BFS Index Stats:" << std::endl;
   std::cout << "  Number of labels: " << bfs_labels << std::endl;
   std::cout << "  Number of rows:  " << bfs_total_rows << std::endl;
-
+  if (enable_bfs_tiered_cache) {
+    std::cout << "  Tiered cache:   enabled" << std::endl;
+    std::cout << "  Dataset cache:  " << bfs_dataset_cache_fname << std::endl;
+  }
   return cuvs::neighbors::vecflow::index<data_t>{
     std::move(ivf_graph_index),
     std::move(ivf_bfs_index),
@@ -943,7 +1270,21 @@ auto build(shared_resources::configured_raft_resources& res,
     std::move(cagra_label_size),
     std::move(cagra_label_offset),
     std::move(bfs_label_size),
+    std::move(bfs_label_offset),
+    std::move(bfs_index_map),
+    std::move(bfs_cache_state),
+    enable_bfs_tiered_cache,
+    bfs_hbm_capacity_bytes,
+    bfs_dram_capacity_bytes,
+    detail::phoenix::bfs_prefetch_max_bytes(),
+    bfs_dataset_cache_fname,
+    std::move(host_bfs_index_map),
+    std::move(host_bfs_label_offset),
+    std::move(host_bfs_label_size),
+    bfs_total_rows,
+    detail::phoenix::bfs_rebalance_interval_queries(),
     std::move(d_cat_freq),
+    std::move(host_cat_freq),
     std::move(cagra_graph_storage),
     std::move(host_cagra_label_size),
     std::move(host_cagra_label_offset),
@@ -951,6 +1292,7 @@ auto build(shared_resources::configured_raft_resources& res,
     graph_degree,
     graph_storage_width,
     dataset_cache_fname,
+    static_cast<int64_t>(dataset.extent(0)),
     static_cast<int>(dataset.extent(1)),
     graph_builder,
     std::move(phoenix_cache_state),

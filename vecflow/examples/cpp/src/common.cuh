@@ -285,13 +285,16 @@ void load_matrix_from_ibin(raft::resources const& res,
 						raft::resource::get_cuda_stream(res));
 }
 
+enum class query_label_match_mode : uint8_t { ANY = 0, ALL = 1 };
+
 void generate_ground_truth(raft::resources const& res,
 													 raft::device_matrix_view<const float, int64_t> dataset,
 													 raft::device_matrix_view<const float, int64_t> queries,
 													 const std::vector<std::vector<int>>& label_data_vecs,
 													 const std::vector<std::vector<int>>& query_label_vecs,
 													 raft::device_matrix_view<uint32_t, int64_t> gt_neighbors,
-													 std::string gt_fname) {
+													 std::string gt_fname,
+													 query_label_match_mode label_match_mode = query_label_match_mode::ANY) {
 
 	std::ifstream file(gt_fname);
 	if (file.good()) {
@@ -313,23 +316,60 @@ void generate_ground_truth(raft::resources const& res,
 			bitmap.size() * sizeof(uint32_t),
 			raft::resource::get_cuda_stream(res)));
 
-	// For each query, set bits for data points that match its label
+	// For each query, set bits for data points that match its labels.
 	for (int64_t q_idx = 0; q_idx < n_queries; q_idx++) {
 		const auto& query_labels = query_label_vecs[q_idx];
-		for (int label : query_labels) {
-			const auto& matching_data_points = label_data_vecs[label];
-			std::vector<uint32_t> h_matching_bits(bitmap.extent(1), 0);
-			for (int data_idx : matching_data_points) {
-				if (data_idx >= n_database) continue;
-				int word_idx = data_idx / 32;
-				int bit_pos = data_idx % 32;
-				h_matching_bits[word_idx] |= (1u << bit_pos);
+		std::vector<uint32_t> h_matching_bits(bitmap.extent(1), 0);
+		if (!query_labels.empty()) {
+			if (label_match_mode == query_label_match_mode::ANY) {
+				for (int label : query_labels) {
+					if (label < 0 || label >= static_cast<int>(label_data_vecs.size())) { continue; }
+					const auto& matching_data_points = label_data_vecs[label];
+					for (int data_idx : matching_data_points) {
+						if (data_idx < 0 || data_idx >= n_database) continue;
+						int word_idx = data_idx / 32;
+						int bit_pos = data_idx % 32;
+						h_matching_bits[word_idx] |= (1u << bit_pos);
+					}
+				}
+			} else {
+				std::vector<int> intersection;
+				bool initialized = false;
+				for (int label : query_labels) {
+					if (label < 0 || label >= static_cast<int>(label_data_vecs.size())) {
+						intersection.clear();
+						initialized = true;
+						break;
+					}
+					const auto& matching_data_points = label_data_vecs[label];
+					if (!initialized) {
+						intersection = matching_data_points;
+						initialized = true;
+					} else {
+						std::vector<int> next_intersection;
+						next_intersection.reserve(std::min(intersection.size(), matching_data_points.size()));
+						std::set_intersection(intersection.begin(),
+						                      intersection.end(),
+						                      matching_data_points.begin(),
+						                      matching_data_points.end(),
+						                      std::back_inserter(next_intersection));
+						intersection.swap(next_intersection);
+					}
+					if (intersection.empty()) { break; }
+				}
+				for (int data_idx : intersection) {
+					if (data_idx < 0 || data_idx >= n_database) continue;
+					int word_idx = data_idx / 32;
+					int bit_pos = data_idx % 32;
+					h_matching_bits[word_idx] |= (1u << bit_pos);
+				}
 			}
-			raft::update_device(bitmap.data_handle() + q_idx * bitmap.extent(1),
-													h_matching_bits.data(),
-													bitmap.extent(1),
-													raft::resource::get_cuda_stream(res));
 		}
+
+		raft::update_device(bitmap.data_handle() + q_idx * bitmap.extent(1),
+									h_matching_bits.data(),
+									bitmap.extent(1),
+									raft::resource::get_cuda_stream(res));
 	}
 
 	// Build brute force index

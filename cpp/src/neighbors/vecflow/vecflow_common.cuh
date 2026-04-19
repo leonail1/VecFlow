@@ -14,8 +14,15 @@
 
 #pragma once
 
-#include <limits>
+#include <array>
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <limits>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
 #include <rmm/device_scalar.hpp>
 #include <rmm/device_uvector.hpp>
 
@@ -29,6 +36,148 @@ inline auto append_suffix_to_filename(const std::string& filename, const std::st
   auto ext = path.extension().string();
   auto parent = path.parent_path();
   return (parent / (stem + suffix + ext)).string();
+}
+
+constexpr std::uint64_t kIbinCacheMetaMagic   = 0x564543464c574341ULL;
+constexpr std::uint32_t kIbinCacheMetaVersion = 1;
+constexpr std::uint64_t kFnv1a64Offset        = 14695981039346656037ULL;
+constexpr std::uint64_t kFnv1a64Prime         = 1099511628211ULL;
+
+struct ibin_cache_meta {
+  std::uint64_t magic          = kIbinCacheMetaMagic;
+  std::uint32_t version        = kIbinCacheMetaVersion;
+  std::uint32_t data_type_size = 0;
+  std::int64_t rows            = 0;
+  std::int64_t cols            = 0;
+  std::uint64_t payload_checksum = 0;
+};
+
+inline auto ibin_cache_meta_path(const std::string& filename) -> std::string
+{
+  return filename + ".meta";
+}
+
+inline auto fnv1a64_update(std::uint64_t checksum, const void* data, std::size_t bytes)
+  -> std::uint64_t
+{
+  auto* ptr = static_cast<const unsigned char*>(data);
+  for (std::size_t i = 0; i < bytes; ++i) {
+    checksum ^= static_cast<std::uint64_t>(ptr[i]);
+    checksum *= kFnv1a64Prime;
+  }
+  return checksum;
+}
+
+inline void write_ibin_cache_meta(const std::string& filename, const ibin_cache_meta& meta)
+{
+  std::ofstream file(ibin_cache_meta_path(filename), std::ios::binary | std::ios::trunc);
+  if (!file) {
+    throw std::runtime_error("Cannot create ibin cache meta file: " + ibin_cache_meta_path(filename));
+  }
+  file.write(reinterpret_cast<const char*>(&meta.magic), sizeof(meta.magic));
+  file.write(reinterpret_cast<const char*>(&meta.version), sizeof(meta.version));
+  file.write(reinterpret_cast<const char*>(&meta.data_type_size), sizeof(meta.data_type_size));
+  file.write(reinterpret_cast<const char*>(&meta.rows), sizeof(meta.rows));
+  file.write(reinterpret_cast<const char*>(&meta.cols), sizeof(meta.cols));
+  file.write(reinterpret_cast<const char*>(&meta.payload_checksum), sizeof(meta.payload_checksum));
+  if (!file) {
+    throw std::runtime_error("Cannot write ibin cache meta file: " + ibin_cache_meta_path(filename));
+  }
+}
+
+inline auto read_ibin_cache_meta(const std::string& filename) -> std::optional<ibin_cache_meta>
+{
+  auto meta_path = ibin_cache_meta_path(filename);
+  if (!std::filesystem::exists(meta_path)) { return std::nullopt; }
+
+  std::ifstream file(meta_path, std::ios::binary);
+  if (!file) {
+    throw std::runtime_error("Cannot open ibin cache meta file: " + meta_path);
+  }
+
+  ibin_cache_meta meta;
+  file.read(reinterpret_cast<char*>(&meta.magic), sizeof(meta.magic));
+  file.read(reinterpret_cast<char*>(&meta.version), sizeof(meta.version));
+  file.read(reinterpret_cast<char*>(&meta.data_type_size), sizeof(meta.data_type_size));
+  file.read(reinterpret_cast<char*>(&meta.rows), sizeof(meta.rows));
+  file.read(reinterpret_cast<char*>(&meta.cols), sizeof(meta.cols));
+  file.read(reinterpret_cast<char*>(&meta.payload_checksum), sizeof(meta.payload_checksum));
+  if (!file) {
+    throw std::runtime_error("Cannot read ibin cache meta file: " + meta_path);
+  }
+  return meta;
+}
+
+inline void validate_ibin_cache_meta(const std::string& filename,
+                                     std::optional<std::uint32_t> expected_type_size = std::nullopt)
+{
+  auto cache_key = filename + "#" +
+                   (expected_type_size.has_value() ? std::to_string(*expected_type_size) : std::string("*"));
+  struct validated_entry {
+    std::filesystem::file_time_type mtime;
+    std::uintmax_t file_size;
+  };
+  thread_local std::unordered_map<std::string, validated_entry> validated;
+  if (auto it = validated.find(cache_key); it != validated.end()) {
+    std::error_code ec;
+    auto mtime = std::filesystem::last_write_time(filename, ec);
+    if (!ec) {
+      auto fsize = std::filesystem::file_size(filename, ec);
+      if (!ec && it->second.mtime == mtime && it->second.file_size == fsize) {
+        return;
+      }
+    }
+    validated.erase(it);
+  }
+
+  auto meta_opt = read_ibin_cache_meta(filename);
+  if (!meta_opt.has_value()) {
+    throw std::runtime_error("Missing ibin cache meta file for: " + filename);
+  }
+
+  auto meta = *meta_opt;
+  if (meta.magic != kIbinCacheMetaMagic || meta.version != kIbinCacheMetaVersion) {
+    throw std::runtime_error("Invalid ibin cache meta header for: " + filename);
+  }
+  if (expected_type_size.has_value() && meta.data_type_size != *expected_type_size) {
+    throw std::runtime_error("ibin cache meta data type size mismatch for: " + filename);
+  }
+
+  std::ifstream file(filename, std::ios::binary);
+  if (!file) { throw std::runtime_error("Cannot open file: " + filename); }
+
+  std::int64_t rows = 0;
+  std::int64_t cols = 0;
+  file.read(reinterpret_cast<char*>(&rows), sizeof(rows));
+  file.read(reinterpret_cast<char*>(&cols), sizeof(cols));
+  if (!file) { throw std::runtime_error("Cannot read ibin header from: " + filename); }
+  if (rows != meta.rows || cols != meta.cols) {
+    throw std::runtime_error("ibin cache meta shape mismatch for: " + filename);
+  }
+
+  std::array<char, 1 << 20> buffer{};
+  auto checksum = kFnv1a64Offset;
+  while (file) {
+    file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    auto bytes = static_cast<std::size_t>(file.gcount());
+    if (bytes == 0) { break; }
+    checksum = fnv1a64_update(checksum, buffer.data(), bytes);
+  }
+  if (file.bad()) {
+    throw std::runtime_error("Cannot read ibin payload from: " + filename);
+  }
+  if (checksum != meta.payload_checksum) {
+    throw std::runtime_error("ibin cache meta checksum mismatch for: " + filename);
+  }
+
+  {
+    std::error_code ec;
+    auto mtime = std::filesystem::last_write_time(filename, ec);
+    auto fsize = ec ? std::uintmax_t{0} : std::filesystem::file_size(filename, ec);
+    if (!ec) {
+      validated[cache_key] = validated_entry{mtime, fsize};
+    }
+  }
 }
 
 inline auto read_ibin_shape(const std::string& filename) -> std::pair<int64_t, int64_t>
@@ -56,7 +205,21 @@ inline void save_matrix_to_ibin(const std::string& filename,
   file.write(reinterpret_cast<const char*>(&rows), sizeof(int64_t));
   file.write(reinterpret_cast<const char*>(&cols), sizeof(int64_t));
   file.write(reinterpret_cast<const char*>(matrix.data_handle()), rows * cols * sizeof(uint32_t));
+  if (!file) { throw std::runtime_error("Cannot write file: " + filename); }
   file.close();
+  if (!file) { throw std::runtime_error("Cannot finalize file: " + filename); }
+
+  auto payload_checksum =
+    fnv1a64_update(kFnv1a64Offset,
+                   matrix.data_handle(),
+                   static_cast<std::size_t>(rows * cols) * sizeof(uint32_t));
+  write_ibin_cache_meta(filename,
+                        ibin_cache_meta{kIbinCacheMetaMagic,
+                                        kIbinCacheMetaVersion,
+                                        static_cast<std::uint32_t>(sizeof(uint32_t)),
+                                        rows,
+                                        cols,
+                                        payload_checksum});
   std::cout << "Saving graph to " << filename << std::endl;
 }
 
@@ -89,6 +252,7 @@ inline void save_vector_to_ibin(const std::string& filename, const std::vector<u
   file.write(reinterpret_cast<const char*>(&rows), sizeof(rows));
   file.write(reinterpret_cast<const char*>(&cols), sizeof(cols));
   file.write(reinterpret_cast<const char*>(values.data()), rows * sizeof(uint32_t));
+  if (!file) { throw std::runtime_error("Cannot write vector to file: " + filename); }
 }
 
 inline auto load_vector_from_ibin(const std::string& filename) -> std::vector<uint32_t>

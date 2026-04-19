@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 import argparse
-import bisect
 import csv
 import json
-import math
 from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Plot VecFlow per-second QPS and cache hit-rate time series')
+    parser = argparse.ArgumentParser(description='Plot VecFlow strict QPS and cache hit-rate time series')
     parser.add_argument('--series', action='append', required=True,
                         help='Series in label=path.json form; can be passed multiple times')
-    parser.add_argument('--bucket-seconds', type=float, default=1.0)
+    parser.add_argument('--algorithm', default=None,
+                        help='Optional algorithm filter when input JSON is a result array')
+    parser.add_argument('--itopk', type=int, default=None,
+                        help='Optional itopk filter when input JSON is a result array')
     parser.add_argument('--output-dir', required=True)
     return parser.parse_args()
 
@@ -43,39 +44,45 @@ def cumulative_metrics(sample: dict) -> dict[str, float]:
     }
 
 
-def interpolate_series(samples: list[dict], t: float) -> dict[str, float]:
-    times = [float(sample['elapsed_seconds']) for sample in samples]
-    if t <= times[0]:
-        return cumulative_metrics(samples[0])
-    if t >= times[-1]:
-        return cumulative_metrics(samples[-1])
-    idx = bisect.bisect_right(times, t)
-    left = samples[idx - 1]
-    right = samples[idx]
-    left_t = float(left['elapsed_seconds'])
-    right_t = float(right['elapsed_seconds'])
-    if right_t <= left_t:
-        return cumulative_metrics(right)
-    alpha = (t - left_t) / (right_t - left_t)
-    left_metrics = cumulative_metrics(left)
-    right_metrics = cumulative_metrics(right)
-    return {
-        key: left_metrics[key] + (right_metrics[key] - left_metrics[key]) * alpha
-        for key in left_metrics
-    }
+def select_entry(payload: dict | list, algorithm: str | None, itopk: int | None) -> dict:
+    if isinstance(payload, dict):
+        return payload
+    if not isinstance(payload, list) or not payload:
+        raise SystemExit('Input JSON must be an object or a non-empty result array')
+    for entry in payload:
+        if algorithm is not None and entry.get('algorithm') != algorithm:
+            continue
+        if itopk is not None and int(entry.get('itopk', -1)) != itopk:
+            continue
+        return entry
+    raise SystemExit('No result entry matched --algorithm/--itopk filters')
 
 
-def bucketize(samples: list[dict], bucket_seconds: float) -> list[dict]:
-    total_seconds = float(samples[-1]['elapsed_seconds'])
-    bucket_count = int(math.floor(total_seconds / bucket_seconds))
+def resolve_samples(payload: dict | list, algorithm: str | None, itopk: int | None) -> list[dict]:
+    entry = select_entry(payload, algorithm, itopk)
+    strict_samples = entry.get('strict_qps_time_series')
+    if isinstance(strict_samples, list) and strict_samples:
+        return strict_samples
+    legacy_samples = entry.get('samples')
+    if isinstance(legacy_samples, list) and legacy_samples:
+        return legacy_samples
+    raise SystemExit('No strict_qps_time_series or legacy samples found in input JSON')
+
+
+def bucketize(samples: list[dict]) -> list[dict]:
     rows: list[dict] = []
-    for bucket in range(bucket_count):
-        t0 = bucket * bucket_seconds
-        t1 = (bucket + 1) * bucket_seconds
-        m0 = interpolate_series(samples, t0)
-        m1 = interpolate_series(samples, t1)
+    for bucket in range(1, len(samples)):
+        s0 = samples[bucket - 1]
+        s1 = samples[bucket]
+        t0 = float(s0['elapsed_seconds'])
+        t1 = float(s1['elapsed_seconds'])
+        dt = t1 - t0
+        if dt <= 0:
+            continue
+        m0 = cumulative_metrics(s0)
+        m1 = cumulative_metrics(s1)
         dq = m1['queries_completed'] - m0['queries_completed']
-        qps = dq / bucket_seconds
+        qps = dq / dt
 
         graph_hbm = m1['graph_hbm'] - m0['graph_hbm']
         graph_dram = m1['graph_dram'] - m0['graph_dram']
@@ -99,6 +106,7 @@ def bucketize(samples: list[dict], bucket_seconds: float) -> list[dict]:
             'bucket': bucket,
             't0_seconds': t0,
             't1_seconds': t1,
+            'delta_seconds': dt,
             'qps': qps,
             'combined_hbm_rate': (combined_hbm / combined_total) if combined_total > 0 else 0.0,
             'combined_dram_rate': (combined_dram / combined_total) if combined_total > 0 else 0.0,
@@ -179,7 +187,8 @@ def main() -> int:
     for raw in args.series:
         label, path = parse_series_arg(raw)
         payload = load_series(path)
-        rows = bucketize(payload['samples'], args.bucket_seconds)
+        samples = resolve_samples(payload, args.algorithm, args.itopk)
+        rows = bucketize(samples)
         all_rows[label] = rows
         write_csv(output_dir / f'{label}_per_second.csv', rows)
         plot_one(label, rows, output_dir / f'{label}_qps_hit_rates.png')

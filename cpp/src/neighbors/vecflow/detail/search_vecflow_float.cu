@@ -27,22 +27,39 @@
 
 namespace cuvs::neighbors::vecflow {
 
-#define instantiate_search_vecflow_d(data_t) \
+#define instantiate_search_vecflow_single_d(data_t) \
  void search( \
-	 shared_resources::configured_raft_resources& res, \
-	 cuvs::neighbors::vecflow::index<data_t>& index, \
-	 raft::device_matrix_view<const data_t, int64_t> queries, \
-	 raft::device_vector_view<uint32_t, int64_t> query_labels, \
-	 int itopk_size, \
-	 raft::device_matrix_view<uint32_t, int64_t> neighbors, \
-	 raft::device_matrix_view<float, int64_t> distances) \
+  shared_resources::configured_raft_resources& res, \
+  cuvs::neighbors::vecflow::index<data_t>& index, \
+  raft::device_matrix_view<const data_t, int64_t> queries, \
+  raft::device_vector_view<uint32_t, int64_t> query_labels, \
+  int itopk_size, \
+  raft::device_matrix_view<uint32_t, int64_t> neighbors, \
+  raft::device_matrix_view<float, int64_t> distances) \
  { \
     cuvs::neighbors::vecflow::search<data_t>( \
       res, index, queries, query_labels, itopk_size, neighbors, distances); \
   }
 
-instantiate_search_vecflow_d(float);
-#undef instantiate_search_vecflow_d
+#define instantiate_search_vecflow_multi_d(data_t) \
+ void search( \
+  shared_resources::configured_raft_resources& res, \
+  cuvs::neighbors::vecflow::index<data_t>& index, \
+  raft::device_matrix_view<const data_t, int64_t> queries, \
+  const cuvs::neighbors::vecflow::multi_label_query_desc& query_labels, \
+  int itopk_size, \
+  raft::device_matrix_view<uint32_t, int64_t> neighbors, \
+  raft::device_matrix_view<float, int64_t> distances) \
+ { \
+    cuvs::neighbors::vecflow::search<data_t>( \
+      res, index, queries, query_labels, itopk_size, neighbors, distances); \
+  }
+
+instantiate_search_vecflow_single_d(float);
+instantiate_search_vecflow_multi_d(float);
+#undef instantiate_search_vecflow_multi_d
+#undef instantiate_search_vecflow_single_d
+
 
 void search_multi_gpu(shared_resources::configured_raft_resources& res,
                       cuvs::neighbors::vecflow::multi_gpu_index<float>& index,
@@ -55,5 +72,4 @@ void search_multi_gpu(shared_resources::configured_raft_resources& res,
   cuvs::neighbors::vecflow::search_multi_gpu_impl(
     res, index, queries, query_labels, itopk_size, neighbors, distances);
 }
-
 }  // namespace cuvs::neighbors::vecflow

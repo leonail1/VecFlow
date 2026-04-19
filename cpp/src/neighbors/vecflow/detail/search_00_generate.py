@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 
-HEADER_TEMPLATE = '''/*
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+HEADER_TEMPLATE = r"""/*
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
 * You may obtain a copy of the License at
@@ -29,35 +33,64 @@ HEADER_TEMPLATE = '''/*
 
 namespace cuvs::neighbors::vecflow {{
 
-#define instantiate_search_vecflow_d(data_t) \\
- void search( \\
-	 shared_resources::configured_raft_resources& res, \\
-	 cuvs::neighbors::vecflow::index<data_t>& index, \\
-	 raft::device_matrix_view<const data_t, int64_t> queries, \\
-	 raft::device_vector_view<uint32_t, int64_t> query_labels, \\
-	 int itopk_size, \\
-	 raft::device_matrix_view<uint32_t, int64_t> neighbors, \\
-	 raft::device_matrix_view<float, int64_t> distances) \\
- {{ \\
-    cuvs::neighbors::vecflow::search<data_t>( \\
-      res, index, queries, query_labels, itopk_size, neighbors, distances); \\
+#define instantiate_search_vecflow_single_d(data_t) \
+ void search( \
+  shared_resources::configured_raft_resources& res, \
+  cuvs::neighbors::vecflow::index<data_t>& index, \
+  raft::device_matrix_view<const data_t, int64_t> queries, \
+  raft::device_vector_view<uint32_t, int64_t> query_labels, \
+  int itopk_size, \
+  raft::device_matrix_view<uint32_t, int64_t> neighbors, \
+  raft::device_matrix_view<float, int64_t> distances) \
+ {{ \
+    cuvs::neighbors::vecflow::search<data_t>( \
+      res, index, queries, query_labels, itopk_size, neighbors, distances); \
   }}
 
-instantiate_search_vecflow_d({0});
-#undef instantiate_search_vecflow_d
+#define instantiate_search_vecflow_multi_d(data_t) \
+ void search( \
+  shared_resources::configured_raft_resources& res, \
+  cuvs::neighbors::vecflow::index<data_t>& index, \
+  raft::device_matrix_view<const data_t, int64_t> queries, \
+  const cuvs::neighbors::vecflow::multi_label_query_desc& query_labels, \
+  int itopk_size, \
+  raft::device_matrix_view<uint32_t, int64_t> neighbors, \
+  raft::device_matrix_view<float, int64_t> distances) \
+ {{ \
+    cuvs::neighbors::vecflow::search<data_t>( \
+      res, index, queries, query_labels, itopk_size, neighbors, distances); \
+  }}
 
-}}  // namespace cuvs::neighbors::vecflow'''
+instantiate_search_vecflow_single_d({data_t});
+instantiate_search_vecflow_multi_d({data_t});
+#undef instantiate_search_vecflow_multi_d
+#undef instantiate_search_vecflow_single_d
+
+{extra_impl}}}  // namespace cuvs::neighbors::vecflow
+"""
+
+FLOAT_EXTRA_IMPL = r"""
+void search_multi_gpu(shared_resources::configured_raft_resources& res,
+                      cuvs::neighbors::vecflow::multi_gpu_index<float>& index,
+                      raft::device_matrix_view<const float, int64_t> queries,
+                      raft::device_vector_view<uint32_t, int64_t> query_labels,
+                      int itopk_size,
+                      raft::device_matrix_view<uint32_t, int64_t> neighbors,
+                      raft::device_matrix_view<float, int64_t> distances)
+{
+  cuvs::neighbors::vecflow::search_multi_gpu_impl(
+    res, index, queries, query_labels, itopk_size, neighbors, distances);
+}
+"""
 
 def generate_files():
-	file_configs = {
-		"search_vecflow_float.cu": "float",
-		"search_vecflow_int8_t.cu": "int8_t"
-	}
-	
-	for filename, data_t in file_configs.items():
-		content = HEADER_TEMPLATE.format(data_t)
-		with open(filename, "w") as f:
-			f.write(content)
+    file_configs = {
+        "search_vecflow_float.cu": ("float", FLOAT_EXTRA_IMPL),
+        "search_vecflow_int8_t.cu": ("int8_t", "\n"),
+    }
+
+    for filename, (data_t, extra_impl) in file_configs.items():
+        (SCRIPT_DIR / filename).write_text(HEADER_TEMPLATE.format(data_t=data_t, extra_impl=extra_impl))
 
 if __name__ == "__main__":
-	generate_files()
+    generate_files()

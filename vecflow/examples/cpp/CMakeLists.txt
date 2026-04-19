@@ -27,10 +27,21 @@ include(rapids-find)
 rapids_cuda_init_architectures(test_cuvs)
 
 project(test_cuvs LANGUAGES CXX CUDA)
+get_filename_component(VECFLOW_CUDA_TOOLKIT_ROOT "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+get_filename_component(VECFLOW_CUDA_TOOLKIT_ROOT "${VECFLOW_CUDA_TOOLKIT_ROOT}/.." ABSOLUTE)
+set(CUDAToolkit_ROOT "${VECFLOW_CUDA_TOOLKIT_ROOT}" CACHE PATH "VecFlow examples CUDA toolkit root." FORCE)
+set(CUDA_TOOLKIT_ROOT_DIR "${VECFLOW_CUDA_TOOLKIT_ROOT}" CACHE PATH "Legacy FindCUDA toolkit root used by CUTLASS." FORCE)
+set(CUDA_BIN_PATH "${VECFLOW_CUDA_TOOLKIT_ROOT}" CACHE PATH "Legacy FindCUDA toolkit root used by CUTLASS." FORCE)
+set(CUDA_NVCC_EXECUTABLE "${CMAKE_CUDA_COMPILER}" CACHE FILEPATH "Legacy FindCUDA nvcc path used by CUTLASS." FORCE)
+find_package(CUDAToolkit REQUIRED)
 find_package(Threads)
 set(VECFLOW_TAGORE_DIM_SIZE
     192
     CACHE STRING "Compile-time Tagore dimension upper bound used by the VecFlow example targets.")
+
+option(VECFLOW_BENCH_PROGRESS_LOG
+  "Enable lightweight progress timestamps in VECFLOW_BENCH (zero cost when OFF)."
+  OFF)
 
 find_package(OpenMP REQUIRED)
 if(OPENMP_FOUND)
@@ -56,6 +67,7 @@ rapids_cpm_find(nlohmann_json
 # -------------- compile tasks ----------------- #
 add_executable(VECFLOW_EXAMPLE src/vecflow_example.cu)
 add_executable(VECFLOW_BENCH src/bench/vecflow_bench.cu)
+add_executable(VECFLOW_QPS_TIMESERIES src/bench/vecflow_qps_timeseries.cu)
 add_executable(VECFLOW_MG_BENCH src/bench/vecflow_mg_bench.cpp)
 add_executable(VECFLOW_TAGORE_SMOKE src/bench/vecflow_tagore_smoke.cu)
 add_executable(VECFLOW_MG_API_SMOKE src/bench/vecflow_mg_api_smoke.cu)
@@ -72,70 +84,42 @@ set(VECFLOW_LOCAL_VECFLOW_SOURCES
   ${VECFLOW_LOCAL_ROOT}/thirdparty/Tagore/src/Tagore_src.cu
 )
 
-target_sources(VECFLOW_EXAMPLE PRIVATE ${VECFLOW_LOCAL_VECFLOW_SOURCES})
-target_sources(VECFLOW_BENCH PRIVATE ${VECFLOW_LOCAL_VECFLOW_SOURCES})
-target_sources(VECFLOW_TAGORE_SMOKE PRIVATE ${VECFLOW_LOCAL_VECFLOW_SOURCES})
-target_sources(VECFLOW_MG_API_SMOKE PRIVATE ${VECFLOW_LOCAL_VECFLOW_SOURCES})
+function(vecflow_configure_local_cuda_target target_name)
+  target_sources(${target_name} PRIVATE ${VECFLOW_LOCAL_VECFLOW_SOURCES})
+  target_include_directories(${target_name} PRIVATE
+    ${VECFLOW_LOCAL_ROOT}/cpp/include
+    ${VECFLOW_LOCAL_ROOT}/thirdparty/Tagore/include
+    /usr/include
+  )
+  target_compile_definitions(${target_name} PRIVATE
+    CUVS_VECFLOW_TAGORE_ENABLED
+    DIM_SIZE=${VECFLOW_TAGORE_DIM_SIZE}
+    FMT_SHARED
+  )
+  # These targets compile local VecFlow CUDA sources directly. Force shared fmt
+  # so nvcc 12.4 does not inherit the transitive header-only configuration.
+  target_compile_options(${target_name} PRIVATE -UFMT_HEADER_ONLY)
+  target_link_libraries(${target_name} PRIVATE fmt::fmt)
+  set_target_properties(${target_name} PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+endfunction()
 
-target_include_directories(VECFLOW_EXAMPLE PRIVATE
-  ${VECFLOW_LOCAL_ROOT}/cpp/include
-  ${VECFLOW_LOCAL_ROOT}/thirdparty/Tagore/include
-  /usr/include
-)
-target_include_directories(VECFLOW_BENCH PRIVATE
-  ${VECFLOW_LOCAL_ROOT}/cpp/include
-  ${VECFLOW_LOCAL_ROOT}/thirdparty/Tagore/include
-  /usr/include
-)
-target_include_directories(VECFLOW_TAGORE_SMOKE PRIVATE
-  ${VECFLOW_LOCAL_ROOT}/cpp/include
-  ${VECFLOW_LOCAL_ROOT}/thirdparty/Tagore/include
-  /usr/include
-)
-target_include_directories(VECFLOW_MG_API_SMOKE PRIVATE
-  ${VECFLOW_LOCAL_ROOT}/cpp/include
-  ${VECFLOW_LOCAL_ROOT}/thirdparty/Tagore/include
-  /usr/include
-)
-
-target_compile_definitions(VECFLOW_EXAMPLE PRIVATE
-  CUVS_VECFLOW_TAGORE_ENABLED
-  DIM_SIZE=${VECFLOW_TAGORE_DIM_SIZE}
-)
-target_compile_definitions(VECFLOW_BENCH PRIVATE
-  CUVS_VECFLOW_TAGORE_ENABLED
-  DIM_SIZE=${VECFLOW_TAGORE_DIM_SIZE}
-)
-target_compile_definitions(VECFLOW_TAGORE_SMOKE PRIVATE
-  CUVS_VECFLOW_TAGORE_ENABLED
-  DIM_SIZE=${VECFLOW_TAGORE_DIM_SIZE}
-)
-target_compile_definitions(VECFLOW_MG_API_SMOKE PRIVATE
-  CUVS_VECFLOW_TAGORE_ENABLED
-  DIM_SIZE=${VECFLOW_TAGORE_DIM_SIZE}
-)
-
-set_target_properties(VECFLOW_EXAMPLE PROPERTIES
-  CUDA_SEPARABLE_COMPILATION ON
-  CUDA_RESOLVE_DEVICE_SYMBOLS ON
-)
-set_target_properties(VECFLOW_BENCH PROPERTIES
-  CUDA_SEPARABLE_COMPILATION ON
-  CUDA_RESOLVE_DEVICE_SYMBOLS ON
-)
-set_target_properties(VECFLOW_TAGORE_SMOKE PROPERTIES
-  CUDA_SEPARABLE_COMPILATION ON
-  CUDA_RESOLVE_DEVICE_SYMBOLS ON
-)
-set_target_properties(VECFLOW_MG_API_SMOKE PROPERTIES
-  CUDA_SEPARABLE_COMPILATION ON
-  CUDA_RESOLVE_DEVICE_SYMBOLS ON
-)
+vecflow_configure_local_cuda_target(VECFLOW_EXAMPLE)
+vecflow_configure_local_cuda_target(VECFLOW_BENCH)
+vecflow_configure_local_cuda_target(VECFLOW_QPS_TIMESERIES)
+vecflow_configure_local_cuda_target(VECFLOW_TAGORE_SMOKE)
+vecflow_configure_local_cuda_target(VECFLOW_MG_API_SMOKE)
 
 # `$<TARGET_NAME_IF_EXISTS:conda_env>` is a generator expression that ensures that targets are
 # installed in a conda environment, if one exists
 target_link_libraries(VECFLOW_EXAMPLE PUBLIC OpenMP::OpenMP_CXX PRIVATE cuvs::cuvs PRIVATE nlohmann_json::nlohmann_json PRIVATE $<TARGET_NAME_IF_EXISTS:conda_env>)
 target_link_libraries(VECFLOW_BENCH PUBLIC OpenMP::OpenMP_CXX PRIVATE cuvs::cuvs PRIVATE nlohmann_json::nlohmann_json PRIVATE $<TARGET_NAME_IF_EXISTS:conda_env>)
+if(VECFLOW_BENCH_PROGRESS_LOG)
+  target_compile_definitions(VECFLOW_BENCH PRIVATE VECFLOW_BENCH_PROGRESS_LOG)
+endif()
+target_link_libraries(VECFLOW_QPS_TIMESERIES PUBLIC OpenMP::OpenMP_CXX PRIVATE cuvs::cuvs PRIVATE nlohmann_json::nlohmann_json PRIVATE $<TARGET_NAME_IF_EXISTS:conda_env>)
 target_link_libraries(VECFLOW_MG_BENCH PRIVATE nlohmann_json::nlohmann_json PRIVATE $<TARGET_NAME_IF_EXISTS:conda_env>)
 target_link_libraries(VECFLOW_TAGORE_SMOKE PUBLIC OpenMP::OpenMP_CXX PRIVATE cuvs::cuvs PRIVATE $<TARGET_NAME_IF_EXISTS:conda_env>)
 target_link_libraries(VECFLOW_MG_API_SMOKE PUBLIC OpenMP::OpenMP_CXX PRIVATE cuvs::cuvs PRIVATE $<TARGET_NAME_IF_EXISTS:conda_env>)
@@ -166,12 +150,15 @@ if(EXISTS "${VECFLOW_PHOENIX_LIB}")
 
   target_link_libraries(VECFLOW_EXAMPLE PRIVATE vecflow_phoenix)
   target_link_libraries(VECFLOW_BENCH PRIVATE vecflow_phoenix)
+  target_link_libraries(VECFLOW_QPS_TIMESERIES PRIVATE vecflow_phoenix)
   target_link_libraries(VECFLOW_MG_API_SMOKE PRIVATE vecflow_phoenix)
   target_compile_definitions(VECFLOW_EXAMPLE PRIVATE CUVS_VECFLOW_PHOENIX_ENABLED)
   target_compile_definitions(VECFLOW_BENCH PRIVATE CUVS_VECFLOW_PHOENIX_ENABLED)
+  target_compile_definitions(VECFLOW_QPS_TIMESERIES PRIVATE CUVS_VECFLOW_PHOENIX_ENABLED)
   target_compile_definitions(VECFLOW_MG_API_SMOKE PRIVATE CUVS_VECFLOW_PHOENIX_ENABLED)
   set_property(TARGET VECFLOW_EXAMPLE APPEND PROPERTY BUILD_RPATH "${VECFLOW_PHOENIX_BUILD_DIR}")
   set_property(TARGET VECFLOW_BENCH APPEND PROPERTY BUILD_RPATH "${VECFLOW_PHOENIX_BUILD_DIR}")
+  set_property(TARGET VECFLOW_QPS_TIMESERIES APPEND PROPERTY BUILD_RPATH "${VECFLOW_PHOENIX_BUILD_DIR}")
   set_property(TARGET VECFLOW_MG_API_SMOKE APPEND PROPERTY BUILD_RPATH "${VECFLOW_PHOENIX_BUILD_DIR}")
 
   add_executable(VECFLOW_PHOENIX_SMOKE src/bench/vecflow_phoenix_smoke.cpp)

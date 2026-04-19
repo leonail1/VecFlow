@@ -103,3 +103,9 @@ datasets/
 
 # local third-party source clones (not committed in this repo)
 /thirdparty/DiskANN/
+
+# large datasets (>100 GB total, not committed)
+/vecflow/datasets/
+
+# phoenix build artifacts
+/thirdparty/phoenix/build*/

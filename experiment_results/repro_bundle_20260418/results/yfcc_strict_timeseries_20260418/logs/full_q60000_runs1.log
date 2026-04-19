@@ -1,0 +1,91 @@
+CMD: numactl --cpunodebind=1 --membind=1 /home/lzg/VecFlow-develop/vecflow/examples/cpp/build/VECFLOW_BENCH --config /home/lzg/VecFlow-develop/experiment_results/repro_bundle_20260418/results/yfcc_strict_timeseries_20260418/configs/full_q60000_runs1.json
+Loading configuration from /home/lzg/VecFlow-develop/experiment_results/repro_bundle_20260418/results/yfcc_strict_timeseries_20260418/configs/full_q60000_runs1.json
+
+=== Configuration ===
+iTopK sizes: [ 64 ]
+Specificity threshold: 2000
+Graph degree: 16
+TopK: 10
+Number of runs: 1
+Warmup runs: 2
+Min benchmark runs: 1
+Max benchmark runs: 1
+Stability window: 1
+Stable subset size: 1
+QPS stability relative tolerance: 0.0000
+Latency stability relative tolerance: 0.0000
+Trend guard relative tolerance: 0.0000
+Tagore iterations: 10
+Use Phoenix graph load: false
+Use Phoenix label load: true
+Phoenix label cache bytes: 17179869184
+Phoenix label DRAM cache bytes: 17179869184
+Phoenix label prefetch max bytes: 0
+Phoenix label dataset cache bytes: 17179869184
+Phoenix label dataset DRAM cache bytes: 17179869184
+Phoenix label dataset prefetch max bytes: 0
+Phoenix label rebalance interval queries: 64
+Enable BFS tiered cache: true
+BFS HBM cache bytes: 17179869184
+BFS DRAM cache bytes: 17179869184
+BFS prefetch max bytes: 0
+BFS rebalance interval queries: 64
+Cascade eviction: true
+Device IDs: [ 0 ]
+Query label mode: single
+Strict QPS sampling enabled: false
+Strict QPS sampling interval seconds: 1.000
+Algorithms to run: [ vecflow ]
+Output JSON file: /home/lzg/VecFlow-develop/experiment_results/repro_bundle_20260418/results/yfcc_strict_timeseries_20260418/raw/full_q60000_runs1.json
+Reading data labels from spmat format: /home/lzg/VecFlow-develop/vecflow/datasets/yfcc10M/base.metadata.10M.spmat
+Reading query labels from spmat format: /home/lzg/VecFlow-develop/vecflow/datasets/yfcc10M/query.metadata.public.single_label.spmat
+
+=== Dataset Information ===
+Base dataset size: N=10000000, dim=192
+Query dataset size: N=61626, dim=192
+Query range: [0, 61626)
+Skip recall: false
+
+=== vecflow Index Building and Search ===
+
+=== Index Information ===
+Deferring IVF-Graph loading to Phoenix label-load path from /home/lzg/VecFlow-develop/vecflow/datasets/yfcc10M/ivf_graph_yfcc10m_t2000.bin
+Initial Phoenix graph placement: HBM labels=6435, DRAM labels=0, SSD labels=0
+Initial Phoenix dataset placement: HBM labels=19, DRAM labels=379, SSD labels=6037
+Loading graph from /home/lzg/VecFlow-develop/vecflow/datasets/yfcc10M/ivf_graph_yfcc10m_t2000.bin
+Phoenix label-load graph fully fits in HBM; attaching full IVF-Graph for direct search.
+Initial BFS placement: HBM labels=187140, DRAM labels=6788, SSD labels=0
+Tiered IVF-BFS cache enabled with dataset cache /home/lzg/VecFlow-develop/vecflow/datasets/yfcc10M/ivf_bfs_yfcc10m_t2000_dataset.bin
+
+IVF-Graph Index Stats:
+  Total vectors:  10000000
+  Number of labels: 6435
+  Graph size:     [80259814 × 16]
+  Graph degree:   16
+
+IVF-BFS Index Stats:
+  Number of labels: 193928
+  Number of rows:  27950662
+  Tiered cache:   enabled
+  Dataset cache:  /home/lzg/VecFlow-develop/vecflow/datasets/yfcc10M/ivf_bfs_yfcc10m_t2000_dataset.bin
+PROGRESS q=0 ts_us=1776574844076252
+PROGRESS q=61626 ts_us=1776574854152854
+Build time: 697.910 s
+
+=== vecflow Search Benchmarking ===
+-- Running vecflow Search (itopk=64) --
+  - Run 1/1: qps=6115.76 latency_ms=10076.591 gpu_ms=10076.521
+  - QPS: 6115.76, Recall@10: 0.8747
+  - Executed runs: 1 (min=1, max=1)
+  - Latency(ms): total avg=10076.591 p50=10076.591 p95=10076.591 max=10076.591
+  - GPU(ms): avg=10076.521 p50=10076.521 p95=10076.521 max=10076.521
+  - CPU-overhead(ms): avg=0.070 p50=0.070 p95=0.070 max=0.070
+  - Cache delta: graph[hbm=0 dram=0 ssd=0] dataset[hbm=0 dram=0 ssd=0] bfs[hbm=1404 dram=553 ssd=0]
+  - First query neighbors: 1082296 9512216 4240553 6902774 3121342 5520822 3912739 4017013 7393979 9198881 
+  - First query ground truth: 1082296 9512216 4240553 6902774 3121342 5520822 3912739 4017013 7393979 9198881 
+
+Writing results to /home/lzg/VecFlow-develop/experiment_results/repro_bundle_20260418/results/yfcc_strict_timeseries_20260418/raw/full_q60000_runs1.json
+Results successfully written.
+
+RC: 0
+Elapsed: 792.0s

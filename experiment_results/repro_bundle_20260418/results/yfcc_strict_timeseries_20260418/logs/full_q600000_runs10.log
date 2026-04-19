@@ -1,0 +1,51 @@
+CMD: numactl --cpunodebind=1 --membind=1 /home/lzg/VecFlow-develop/vecflow/examples/cpp/build/VECFLOW_BENCH --config /home/lzg/VecFlow-develop/experiment_results/repro_bundle_20260418/results/yfcc_strict_timeseries_20260418/configs/full_q600000_runs10.json
+Loading configuration from /home/lzg/VecFlow-develop/experiment_results/repro_bundle_20260418/results/yfcc_strict_timeseries_20260418/configs/full_q600000_runs10.json
+
+=== Configuration ===
+iTopK sizes: [ 64 ]
+Specificity threshold: 2000
+Graph degree: 16
+TopK: 10
+Number of runs: 10
+Warmup runs: 2
+Min benchmark runs: 10
+Max benchmark runs: 10
+Stability window: 10
+Stable subset size: 10
+QPS stability relative tolerance: 0.0000
+Latency stability relative tolerance: 0.0000
+Trend guard relative tolerance: 0.0000
+Tagore iterations: 10
+Use Phoenix graph load: false
+Use Phoenix label load: true
+Phoenix label cache bytes: 17179869184
+Phoenix label DRAM cache bytes: 17179869184
+Phoenix label prefetch max bytes: 0
+Phoenix label dataset cache bytes: 17179869184
+Phoenix label dataset DRAM cache bytes: 17179869184
+Phoenix label dataset prefetch max bytes: 0
+Phoenix label rebalance interval queries: 64
+Enable BFS tiered cache: true
+BFS HBM cache bytes: 17179869184
+BFS DRAM cache bytes: 17179869184
+BFS prefetch max bytes: 0
+BFS rebalance interval queries: 64
+Cascade eviction: true
+Device IDs: [ 0 ]
+Query label mode: single
+Strict QPS sampling enabled: false
+Strict QPS sampling interval seconds: 1.000
+Algorithms to run: [ vecflow ]
+Output JSON file: /home/lzg/VecFlow-develop/experiment_results/repro_bundle_20260418/results/yfcc_strict_timeseries_20260418/raw/full_q600000_runs10.json
+Reading data labels from spmat format: /home/lzg/VecFlow-develop/vecflow/datasets/yfcc10M/base.metadata.10M.spmat
+Reading query labels from spmat format: /home/lzg/VecFlow-develop/vecflow/datasets/yfcc10M/query.metadata.public.single_label.spmat
+
+=== Dataset Information ===
+Base dataset size: N=10000000, dim=192
+Query dataset size: N=61626, dim=192
+Query range: [0, 61626)
+Skip recall: false
+
+=== vecflow Index Building and Search ===
+
+=== Index Information ===

@@ -32,10 +32,13 @@
 #include <iostream>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
+
+#include "vecflow_common.cuh"
 
 #ifdef CUVS_VECFLOW_PHOENIX_ENABLED
 #include "phoenix.h"
@@ -55,6 +58,11 @@ inline auto env_truthy(const char* value) -> bool
          std::strcmp(value, "YES") == 0;
 }
 
+inline auto env_present(const char* name) -> bool
+{
+  return std::getenv(name) != nullptr;
+}
+
 inline auto env_uint64_or_default(const char* value, std::uint64_t default_value) -> std::uint64_t
 {
   if (value == nullptr || *value == '\0') { return default_value; }
@@ -64,8 +72,22 @@ inline auto env_uint64_or_default(const char* value, std::uint64_t default_value
   return static_cast<std::uint64_t>(parsed);
 }
 
+template <typename T, typename Accessor>
+inline auto runtime_config_value(Accessor accessor) -> std::optional<T>
+{
+  auto config = cuvs::neighbors::vecflow::get_runtime_config();
+  if (!config.has_value()) { return std::nullopt; }
+  return accessor(*config);
+}
+
 inline auto use_phoenix_graph_load() -> bool
 {
+  if (auto value = runtime_config_value<bool>([](auto const& config) {
+        return config.use_phoenix_graph_load;
+      });
+      value.has_value()) {
+    return *value;
+  }
 #ifdef CUVS_VECFLOW_PHOENIX_ENABLED
   return env_truthy(std::getenv("CUVS_VECFLOW_USE_PHOENIX_GRAPH_LOAD"));
 #else
@@ -75,6 +97,12 @@ inline auto use_phoenix_graph_load() -> bool
 
 inline auto use_phoenix_label_load() -> bool
 {
+  if (auto value = runtime_config_value<bool>([](auto const& config) {
+        return config.use_phoenix_label_load;
+      });
+      value.has_value()) {
+    return *value;
+  }
 #ifdef CUVS_VECFLOW_PHOENIX_ENABLED
   return env_truthy(std::getenv("CUVS_VECFLOW_USE_PHOENIX_LABEL_LOAD"));
 #else
@@ -84,6 +112,12 @@ inline auto use_phoenix_label_load() -> bool
 
 inline auto phoenix_label_cache_bytes() -> std::size_t
 {
+  if (auto value = runtime_config_value<std::size_t>([](auto const& config) {
+        return config.phoenix_label_cache_bytes;
+      });
+      value.has_value()) {
+    return *value;
+  }
 #ifdef CUVS_VECFLOW_PHOENIX_ENABLED
   return static_cast<std::size_t>(env_uint64_or_default(
     std::getenv("CUVS_VECFLOW_PHOENIX_LABEL_CACHE_BYTES"), 1ULL << 30));
@@ -94,6 +128,12 @@ inline auto phoenix_label_cache_bytes() -> std::size_t
 
 inline auto phoenix_label_dram_cache_bytes() -> std::size_t
 {
+  if (auto value = runtime_config_value<std::size_t>([](auto const& config) {
+        return config.phoenix_label_dram_cache_bytes;
+      });
+      value.has_value()) {
+    return *value;
+  }
 #ifdef CUVS_VECFLOW_PHOENIX_ENABLED
   return static_cast<std::size_t>(env_uint64_or_default(
     std::getenv("CUVS_VECFLOW_PHOENIX_LABEL_DRAM_CACHE_BYTES"), 0));
@@ -104,6 +144,12 @@ inline auto phoenix_label_dram_cache_bytes() -> std::size_t
 
 inline auto phoenix_label_prefetch_max_bytes() -> std::size_t
 {
+  if (auto value = runtime_config_value<std::size_t>([](auto const& config) {
+        return config.phoenix_label_prefetch_max_bytes;
+      });
+      value.has_value()) {
+    return *value;
+  }
 #ifdef CUVS_VECFLOW_PHOENIX_ENABLED
   return static_cast<std::size_t>(env_uint64_or_default(
     std::getenv("CUVS_VECFLOW_PHOENIX_LABEL_PREFETCH_MAX_BYTES"), 0));
@@ -114,6 +160,12 @@ inline auto phoenix_label_prefetch_max_bytes() -> std::size_t
 
 inline auto phoenix_label_rebalance_interval_queries() -> std::size_t
 {
+  if (auto value = runtime_config_value<std::size_t>([](auto const& config) {
+        return config.phoenix_label_rebalance_interval_queries;
+      });
+      value.has_value()) {
+    return *value;
+  }
 #ifdef CUVS_VECFLOW_PHOENIX_ENABLED
   return static_cast<std::size_t>(env_uint64_or_default(
     std::getenv("CUVS_VECFLOW_PHOENIX_LABEL_REBALANCE_INTERVAL_QUERIES"), 64));
@@ -124,6 +176,12 @@ inline auto phoenix_label_rebalance_interval_queries() -> std::size_t
 
 inline auto phoenix_label_dataset_cache_bytes() -> std::size_t
 {
+  if (auto value = runtime_config_value<std::size_t>([](auto const& config) {
+        return config.phoenix_label_dataset_cache_bytes;
+      });
+      value.has_value()) {
+    return *value;
+  }
 #ifdef CUVS_VECFLOW_PHOENIX_ENABLED
   return static_cast<std::size_t>(env_uint64_or_default(
     std::getenv("CUVS_VECFLOW_PHOENIX_LABEL_DATASET_CACHE_BYTES"),
@@ -135,6 +193,12 @@ inline auto phoenix_label_dataset_cache_bytes() -> std::size_t
 
 inline auto phoenix_label_dataset_dram_cache_bytes() -> std::size_t
 {
+  if (auto value = runtime_config_value<std::size_t>([](auto const& config) {
+        return config.phoenix_label_dataset_dram_cache_bytes;
+      });
+      value.has_value()) {
+    return *value;
+  }
 #ifdef CUVS_VECFLOW_PHOENIX_ENABLED
   return static_cast<std::size_t>(env_uint64_or_default(
     std::getenv("CUVS_VECFLOW_PHOENIX_LABEL_DATASET_DRAM_CACHE_BYTES"),
@@ -146,6 +210,12 @@ inline auto phoenix_label_dataset_dram_cache_bytes() -> std::size_t
 
 inline auto phoenix_label_dataset_prefetch_max_bytes() -> std::size_t
 {
+  if (auto value = runtime_config_value<std::size_t>([](auto const& config) {
+        return config.phoenix_label_dataset_prefetch_max_bytes;
+      });
+      value.has_value()) {
+    return *value;
+  }
 #ifdef CUVS_VECFLOW_PHOENIX_ENABLED
   return static_cast<std::size_t>(env_uint64_or_default(
     std::getenv("CUVS_VECFLOW_PHOENIX_LABEL_DATASET_PREFETCH_MAX_BYTES"),
@@ -153,6 +223,81 @@ inline auto phoenix_label_dataset_prefetch_max_bytes() -> std::size_t
 #else
   return 0;
 #endif
+}
+
+inline auto bfs_tiered_cache_enabled() -> bool
+{
+  if (auto value = runtime_config_value<bool>([](auto const& config) {
+        return config.enable_bfs_tiered_cache;
+      });
+      value.has_value()) {
+    return *value;
+  }
+  return env_present("CUVS_VECFLOW_BFS_HBM_CACHE_BYTES") ||
+         env_present("CUVS_VECFLOW_BFS_DRAM_CACHE_BYTES") ||
+         env_present("CUVS_VECFLOW_BFS_PREFETCH_MAX_BYTES") ||
+         env_present("CUVS_VECFLOW_BFS_REBALANCE_INTERVAL");
+}
+
+inline auto bfs_hbm_cache_bytes() -> std::size_t
+{
+  if (auto value = runtime_config_value<std::size_t>([](auto const& config) {
+        return config.bfs_hbm_cache_bytes;
+      });
+      value.has_value()) {
+    return *value;
+  }
+  return static_cast<std::size_t>(
+    env_uint64_or_default(std::getenv("CUVS_VECFLOW_BFS_HBM_CACHE_BYTES"), 0));
+}
+
+inline auto bfs_dram_cache_bytes() -> std::size_t
+{
+  if (auto value = runtime_config_value<std::size_t>([](auto const& config) {
+        return config.bfs_dram_cache_bytes;
+      });
+      value.has_value()) {
+    return *value;
+  }
+  return static_cast<std::size_t>(
+    env_uint64_or_default(std::getenv("CUVS_VECFLOW_BFS_DRAM_CACHE_BYTES"), 0));
+}
+
+inline auto bfs_prefetch_max_bytes() -> std::size_t
+{
+  if (auto value = runtime_config_value<std::size_t>([](auto const& config) {
+        return config.bfs_prefetch_max_bytes;
+      });
+      value.has_value()) {
+    return *value;
+  }
+  return static_cast<std::size_t>(
+    env_uint64_or_default(std::getenv("CUVS_VECFLOW_BFS_PREFETCH_MAX_BYTES"), 0));
+}
+
+inline auto bfs_rebalance_interval_queries() -> std::size_t
+{
+  if (auto value = runtime_config_value<std::size_t>([](auto const& config) {
+        return config.bfs_rebalance_interval_queries;
+      });
+      value.has_value()) {
+    return *value;
+  }
+  return static_cast<std::size_t>(
+    env_uint64_or_default(std::getenv("CUVS_VECFLOW_BFS_REBALANCE_INTERVAL"), 64));
+}
+
+inline auto cascade_eviction_enabled() -> bool
+{
+  if (auto value = runtime_config_value<bool>([](auto const& config) {
+        return config.cascade_eviction;
+      });
+      value.has_value()) {
+    return *value;
+  }
+  auto* value = std::getenv("CUVS_VECFLOW_CASCADE_EVICTION");
+  if (value == nullptr) { return true; }
+  return env_truthy(value);
 }
 
 #ifdef CUVS_VECFLOW_PHOENIX_ENABLED
@@ -343,9 +488,11 @@ class phoenix_file_session : public std::enable_shared_from_this<phoenix_file_se
 
   phoenix_file_session(const std::string& filename,
                        std::int64_t expected_rows,
-                       std::int64_t expected_cols)
+                       std::int64_t expected_cols,
+                       std::optional<std::uint32_t> expected_type_size = std::nullopt)
     : filename_(filename), metadata_(read_ibin_metadata(filename))
   {
+    validate_ibin_cache_meta(filename, expected_type_size);
     if (metadata_.rows != expected_rows || metadata_.cols != expected_cols) {
       throw std::runtime_error("File dimensions do not match cached VecFlow graph dimensions");
     }
@@ -452,20 +599,23 @@ class phoenix_file_session : public std::enable_shared_from_this<phoenix_file_se
 template <typename T>
 inline auto get_file_session(const std::string& filename,
                              std::int64_t expected_rows,
-                             std::int64_t expected_cols)
+                             std::int64_t expected_cols,
+                             std::optional<std::uint32_t> expected_type_size = std::nullopt)
   -> std::shared_ptr<phoenix_file_session<T>>
 {
   int cuda_device_ordinal = 0;
   RAFT_CUDA_TRY(cudaGetDevice(&cuda_device_ordinal));
   thread_local std::unordered_map<std::string, std::weak_ptr<phoenix_file_session<T>>> sessions;
-  auto cache_key = filename + "#" + std::to_string(cuda_device_ordinal);
+  auto cache_key = filename + "#" + std::to_string(cuda_device_ordinal) + "#" +
+                   (expected_type_size.has_value() ? std::to_string(*expected_type_size)
+                                                   : std::string("*"));
   auto it = sessions.find(cache_key);
   if (it != sessions.end()) {
     if (auto existing = it->second.lock()) { return existing; }
   }
 
-  auto session =
-    std::make_shared<phoenix_file_session<T>>(filename, expected_rows, expected_cols);
+  auto session = std::make_shared<phoenix_file_session<T>>(
+    filename, expected_rows, expected_cols, expected_type_size);
   sessions[cache_key] = session;
   return session;
 }
@@ -486,7 +636,7 @@ class async_ibin_rows_request {
       throw std::invalid_argument("Requested Phoenix async graph row range is out of bounds");
     }
 
-    session_ = get_file_session<T>(filename, total_rows, expected_cols);
+    session_ = get_file_session<T>(filename, total_rows, expected_cols, static_cast<std::uint32_t>(sizeof(T)));
     auto cols = session_->cols();
 
     try {
@@ -586,7 +736,7 @@ inline auto load_ibin_to_device(raft::resources const& res,
   -> std::shared_ptr<T>
 {
   (void)res;
-  auto session    = get_file_session<T>(filename, expected_rows, expected_cols);
+  auto session = get_file_session<T>(filename, expected_rows, expected_cols, static_cast<std::uint32_t>(sizeof(T)));
   auto data_bytes = static_cast<std::size_t>(session->rows()) * static_cast<std::size_t>(session->cols()) *
                     sizeof(T);
   auto aligned_bytes = round_up(data_bytes, kPhoenixPageAlignment);
@@ -625,7 +775,7 @@ inline auto load_ibin_rows_to_device(raft::resources const& res,
     throw std::invalid_argument("Requested Phoenix ibin row range is out of bounds");
   }
   (void)res;
-  auto session = get_file_session<T>(filename, total_rows, expected_cols);
+  auto session = get_file_session<T>(filename, total_rows, expected_cols, static_cast<std::uint32_t>(sizeof(T)));
   auto data_bytes = static_cast<std::size_t>(rows_to_load) * static_cast<std::size_t>(session->cols()) *
                     sizeof(T);
   auto aligned_bytes = round_up(data_bytes, kPhoenixPageAlignment);
